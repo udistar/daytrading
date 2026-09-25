@@ -1,9 +1,12 @@
 import time
 
 import pytest
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QApplication, QCheckBox, QLineEdit, QMessageBox
 
-from daytrading.settings import SCHEMA, SettingsStore, default_settings
+from daytrading.paper import CheckResult
+from daytrading.settings import SCHEMA, SettingsStore, default_settings, validate_settings
 from daytrading.ui import MainWindow
 
 ALTERNATES = {
@@ -190,4 +193,57 @@ def test_pause_emergency_and_sim_tables(qapp, tmp_path, monkeypatch):
     assert window.position_table.rowCount() > 0
     assert window.order_table.rowCount() > 0
     assert "거절" in window.flow.toPlainText() or "신호" in window.flow.toPlainText()
+    assert window.pnl.text() == "시나리오별 손익"
+    assert "morning" in window.budget.text()
+    assert "daily_loss" in window.budget.text()
+    colored = False
+    for row in range(window.quote_table.rowCount()):
+        item = window.quote_table.item(row, 3)
+        if item.text() == "상승":
+            assert item.foreground().color() == QColor(Qt.GlobalColor.red)
+            colored = True
+        elif item.text() == "하락":
+            assert item.foreground().color() == QColor(Qt.GlobalColor.blue)
+            colored = True
+    assert colored
+    window.close()
+
+
+def test_loss_budget_label_uses_the_saved_limit(qapp, tmp_path):
+    raw = default_settings().to_dict()
+    raw["daily_loss_limit_krw"] = 1_500_000
+    SettingsStore(tmp_path).save(validate_settings(raw))
+    window = MainWindow(tmp_path)
+    window.show()
+    qapp.processEvents()
+    assert "1,500,000" in window.budget.text()
+    assert "1,000,000" not in window.budget.text()
+    window.close()
+
+
+def test_connection_check_button_does_not_send_orders(qapp, tmp_path, monkeypatch):
+    calls = []
+
+    def fake_check(home, settings, **kwargs):
+        calls.append(kwargs)
+        return CheckResult(True, "모의투자 접속 확인. 주문은 내지 않았습니다.", token_ok=True, orders_sent=0)
+
+    monkeypatch.setattr("daytrading.paper.check_from_home", fake_check)
+    window = MainWindow(tmp_path)
+    window.show()
+    qapp.processEvents()
+    window.check_button.click()
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        qapp.processEvents()
+        if calls and "주문은 내지 않았습니다" in window.statusBar().currentMessage():
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError("연결 확인이 끝나지 않았습니다.")
+    assert calls
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.No)
+    window.paper_button.click()
+    qapp.processEvents()
+    assert window.paper_worker is None or not window.paper_worker.isRunning()
     window.close()

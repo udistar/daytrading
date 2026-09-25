@@ -61,7 +61,7 @@ def load_dashboard(log_dir: Path) -> dict:
     books = _rows(log_dir / "orderbook.csv")
     summary_path = log_dir / "summary.json"
     summaries = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else []
-    pnl = sum(int(item["pnl_krw"]) for item in summaries) if summaries else 0
+    pnl = int(summaries[0]["pnl_krw"]) if len(summaries) == 1 else None
     last_price: dict[str, int] = {}
     prev_price: dict[str, int] = {}
     names: dict[str, str] = {}

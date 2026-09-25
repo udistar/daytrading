@@ -21,7 +21,22 @@ class Journal:
         )
         self.fills = self._open(
             "fills.csv",
-            ["ts", "scenario", "order_id", "code", "name", "side", "reason", "qty", "price", "fee_krw", "tax_krw", "realized_delta_krw"],
+            [
+                "ts",
+                "scenario",
+                "order_id",
+                "code",
+                "name",
+                "side",
+                "reason",
+                "qty",
+                "price",
+                "fee_krw",
+                "tax_krw",
+                "realized_delta_krw",
+                "trigger_price",
+                "slippage_krw",
+            ],
         )
         self.rejections = self._open("rejections.csv", ["ts", "scenario", "code", "side", "reason", "detail"])
         self.books = self._open(
@@ -78,6 +93,8 @@ class Journal:
                 fill.fee_krw,
                 fill.tax_krw,
                 fill.realized_delta_krw,
+                fill.trigger_price,
+                fill.slippage_krw,
             ]
         )
 

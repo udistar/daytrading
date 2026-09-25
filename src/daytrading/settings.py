@@ -222,6 +222,43 @@ def tick_size(settings: Settings, price: int) -> int:
     return rules[-1][1]
 
 
+def _align_down(price: int, settings: Settings) -> int:
+    tick = tick_size(settings, max(int(price), 1))
+    return max(tick, (int(price) // tick) * tick)
+
+
+def _align_up(price: int, settings: Settings) -> int:
+    tick = tick_size(settings, max(int(price), 1))
+    return ((int(price) + tick - 1) // tick) * tick
+
+
+def price_band(prev_close: int, settings: Settings) -> tuple[int, int]:
+    """전일종가 기준 상하한가. 기본 폭은 설정의 상한가 비율(30%)이다."""
+    ratio = float(settings.limit_up_ratio_pct) / 100
+    upper = _align_down(int(prev_close * (1 + ratio)), settings)
+    lower = _align_up(max(1, int(prev_close * (1 - ratio))), settings)
+    if lower > upper:
+        lower = upper
+    return lower, upper
+
+
+def clamp_to_market(price: int, prev_close: int, settings: Settings) -> int:
+    """가격을 호가 단위와 당일 가격제한폭 안으로 맞춘다."""
+    price = int(price)
+    if price <= 0:
+        return 1
+    if prev_close <= 0:
+        return _align_down(price, settings)
+    lower, upper = price_band(prev_close, settings)
+    bounded = min(upper, max(lower, price))
+    snapped = _align_down(bounded, settings)
+    if snapped < lower:
+        snapped = _align_up(lower, settings)
+    if snapped > upper:
+        snapped = _align_down(upper, settings)
+    return snapped
+
+
 def pyramid_levels(settings: Settings) -> list[tuple[float, int]]:
     count = int(settings.max_buys_per_stock)
     levels = []
@@ -366,7 +403,10 @@ class SettingsStore:
     def save(self, settings: Settings) -> list[dict[str, Any]]:
         validated = validate_settings(settings.to_dict())
         self.home.mkdir(parents=True, exist_ok=True)
-        previous = self.load() if self.path.exists() else default_settings()
+        try:
+            previous = self.load() if self.path.exists() else default_settings()
+        except (SettingsError, json.JSONDecodeError, OSError):
+            previous = default_settings()
         changes = diff_settings(previous, validated)
         payload = {"schema_version": SCHEMA_VERSION, "values": validated.to_dict()}
         self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

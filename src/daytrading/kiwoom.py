@@ -65,11 +65,10 @@ def signed_price(value: Any) -> int | None:
     text = str(value).strip().replace(",", "")
     if not text:
         return None
-    sign = -1 if text.startswith("-") else 1
     digits = text[1:] if text[0] in "+-" else text
     if not digits.replace(".", "", 1).isdigit():
         return None
-    return int(abs(float(digits)) * (1 if sign > 0 else 1))
+    return int(abs(float(digits)))
 
 
 def order_body(
@@ -162,6 +161,29 @@ def change_rank_body() -> dict[str, str]:
     }
 
 
+def extract_codes(payload: Any) -> list[str]:
+    """순위 응답에서 stk_cd만 모은다. 목록 키 이름은 예제마다 달라서 값 이름으로 찾는다."""
+    found: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in {"stk_cd", "code"} and isinstance(value, str) and value.strip():
+                    found.append(normalize_code(value))
+                else:
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(payload)
+    unique: list[str] = []
+    for code in found:
+        if code and code not in unique:
+            unique.append(code)
+    return unique
+
+
 def parse_real_messages(message: dict[str, Any]) -> list[dict[str, Any]]:
     """REAL 패킷을 이벤트 목록으로 푼다.
 
@@ -243,7 +265,7 @@ def _float(value: Any) -> float | None:
 class KiwoomClient:
     """모의투자 REST. 네트워크는 호출자가 명시적으로 요청할 때만 연다."""
 
-    def __init__(self, app_key: str, app_secret: str, mode: str = "paper"):
+    def __init__(self, app_key: str, app_secret: str, mode: str = "paper", opener=None):
         if mode != "paper":
             raise LiveTradingLocked("v0에서는 실전 주소(api.kiwoom.com)로 접속할 수 없습니다.")
         if not app_key or not app_secret:
@@ -254,6 +276,7 @@ class KiwoomClient:
         self.base_url = PAPER_REST
         self.ws_url = PAPER_WS + WS_PATH
         self.token = ""
+        self._opener = opener or urllib.request.urlopen
 
     def issue_token(self) -> str:
         payload = self._post(TOKEN_PATH, token_body(self.app_key, self.app_secret), api_id=TR_TOKEN, auth=False)
@@ -267,6 +290,12 @@ class KiwoomClient:
         api_id = TR_BUY if intent_side == "buy" else TR_SELL
         body = order_body(code=code, qty=qty, limit_price=limit_price, market=market)
         return self._post(ORDER_PATH, body, api_id=api_id, auth=True)
+
+    def volume_rank(self) -> dict[str, Any]:
+        return self._post(RANK_PATH, volume_surge_body(), api_id=TR_VOLUME_SURGE, auth=True)
+
+    def change_rank(self) -> dict[str, Any]:
+        return self._post(RANK_PATH, change_rank_body(), api_id=TR_CHANGE_RANK, auth=True)
 
     def stock_info(self, code: str) -> dict[str, Any]:
         # TODO: ka10001 공식 컬럼에는 관리·투자경고·ETF·상장일이 없다.
@@ -282,7 +311,7 @@ class KiwoomClient:
             headers = request_headers(self.token, api_id)
         request = urllib.request.Request(self.base_url + path, data=data, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with self._opener(request, timeout=10) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")

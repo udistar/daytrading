@@ -7,7 +7,7 @@ name = "daytrading"
 version = "0.1.0"
 description = "Kiwoom REST paper day-trading desktop app (v0)"
 requires-python = ">=3.11"
-dependencies = ["PySide6>=6.6"]
+dependencies = ["PySide6>=6.6", "websocket-client>=1.8"]
 
 [project.scripts]
 daytrading = "daytrading.__main__:main"

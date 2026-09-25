@@ -19,12 +19,19 @@ class RateGate:
         self.tr_interval = 1.0 / float(settings.paper_tr_per_sec)
         self.tr_last: dict[str, datetime] = {}
 
-    def ready(self, tr_id: str, now: datetime) -> bool:
+    def bucket_ready(self, now: datetime) -> bool:
+        self._refill(now)
+        return self.tokens >= 1
+
+    def tr_ready(self, tr_id: str, now: datetime) -> bool:
         self._refill(now)
         last = self.tr_last.get(tr_id)
-        if last is not None and (now - last).total_seconds() + 1e-9 < self.tr_interval:
-            return False
-        return self.tokens >= 1
+        if last is None:
+            return True
+        return (now - last).total_seconds() + 1e-9 >= self.tr_interval
+
+    def ready(self, tr_id: str, now: datetime) -> bool:
+        return self.bucket_ready(now) and self.tr_ready(tr_id, now)
 
     def take(self, tr_id: str, now: datetime) -> bool:
         if not self.ready(tr_id, now):
@@ -64,3 +71,15 @@ class OrderQueue:
 
     def pop(self) -> Intent:
         return heapq.heappop(self._heap)[2]
+
+    def cancel(self, code: str, side: str) -> list[Intent]:
+        kept: list[tuple[int, int, Intent]] = []
+        removed: list[Intent] = []
+        for item in self._heap:
+            if item[2].code == code and item[2].side == side:
+                removed.append(item[2])
+            else:
+                kept.append(item)
+        heapq.heapify(kept)
+        self._heap = kept
+        return removed

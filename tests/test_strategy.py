@@ -152,14 +152,16 @@ def test_add_blocks():
     assert add_block_reason(good_snap(strength=105), held, settings) == "추가 체결강도 부족"
     assert add_block_reason(good_snap(strength=90), held, settings) == "체결강도 급락"
     assert add_block_reason(good_snap(session_high_before=20_000), held, settings) == "신고가 갱신 아님"
+    assert add_block_reason(good_snap(price=10_550, session_high_before=10_550), held, settings) == "신고가 갱신 아님"
     rich = position(fill_notional=1_200_000, qty=100, last_buy_at=ts(9, 5, 0))
     assert add_block_reason(snap, rich, settings) == "이익 상태 아님"
     down = Bar(start=ts(9, 4), open=110, high=110, low=100, close=100, value=1)
     assert add_block_reason(good_snap(completed_bars=(down, down)), held, settings) == "연속 음봉"
     wick = Bar(start=ts(9, 5), open=100, high=120, low=100, close=110, value=1)
     assert add_block_reason(good_snap(completed_bars=(wick,)), held, settings) == "긴 윗꼬리"
-    dropped = good_snap(prev_minute_value=1_000_000, minute_value=400_000)
-    assert add_block_reason(dropped, held, settings) == "1분 거래대금 급감"
+    tall = Bar(start=ts(9, 4), open=100, high=100, low=100, close=100, value=1_000_000)
+    short = Bar(start=ts(9, 5), open=100, high=100, low=100, close=100, value=400_000)
+    assert add_block_reason(good_snap(completed_bars=(tall, short)), held, settings) == "1분 거래대금 급감"
     assert add_block_reason(good_snap(ts=ts(9, 45, 0)), held, settings) == "추가 매수 마감"
 
 
@@ -184,12 +186,20 @@ def test_first_entry_stop_and_trail_and_breakeven():
         settings,
     )
     assert trail.reason == "trail"
-    be = maybe_exit(
-        good_snap(price=10_020, prev_price=10_040),
-        position(high_since_entry=10_200, breakeven_armed=True),
-        wide,
-    )
+    held_be = position(high_since_entry=10_200)
+    armed = maybe_exit(good_snap(price=10_250, prev_price=10_200), held_be, wide)
+    assert armed is None
+    assert held_be.breakeven_armed is True
+    be = maybe_exit(good_snap(price=10_020, prev_price=10_040), held_be, wide)
+    assert be is not None
     assert be.reason == "breakeven"
+    raised = position(high_since_entry=10_300)
+    maybe_exit(good_snap(price=10_250, prev_price=10_200), raised, wide)
+    assert raised.breakeven_armed is True
+    raised.fill_notional = 1_080_000
+    after_add = maybe_exit(good_snap(price=10_250, prev_price=10_240), raised, wide)
+    assert raised.breakeven_armed is False
+    assert after_add is None or after_add.reason != "breakeven"
 
 
 def test_partial_take_profit_once_and_time_stop():

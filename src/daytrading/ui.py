@@ -79,6 +79,76 @@ class SimWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class CheckWorker(QThread):
+    finished_ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, home: Path, settings: Settings):
+        super().__init__()
+        self.home = home
+        self.settings = settings
+
+    def run(self) -> None:
+        try:
+            from daytrading.paper import check_from_home
+
+            result = check_from_home(self.home, self.settings)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+            return
+        if result.ok:
+            self.finished_ok.emit(result.message)
+        else:
+            self.failed.emit(result.message)
+
+
+class PaperWorker(QThread):
+    finished_ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, home: Path, settings: Settings, controls: dict, dry_run: bool = False):
+        super().__init__()
+        self.home = home
+        self.settings = settings
+        self.controls = controls
+        self.dry_run = dry_run
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        try:
+            from daytrading.journal import Journal
+            from daytrading.paper import run_paper
+            from daytrading.secrets import load_secrets, missing_secret_names
+
+            secrets = load_secrets(self.home)
+            missing = [name for name in missing_secret_names(secrets) if name != "KIWOOM_ACCOUNT_NO"]
+            if missing:
+                self.failed.emit("모의투자 키가 없습니다. " + ", ".join(missing))
+                return
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            log_dir = self.home / "logs" / f"paper-{stamp}"
+            journal = Journal(log_dir)
+            try:
+                run_paper(
+                    self.settings,
+                    journal,
+                    secrets["KIWOOM_APP_KEY"],
+                    secrets["KIWOOM_APP_SECRET"],
+                    dry_run=self.dry_run,
+                    meta_path=self.home / "symbols_meta.csv",
+                    controls=self.controls,
+                    should_stop=lambda: self._stop,
+                )
+            finally:
+                journal.close()
+            self.finished_ok.emit(str(log_dir))
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
 class SettingsPage(QWidget):
     def __init__(self, store: SettingsStore):
         super().__init__()
@@ -222,6 +292,8 @@ class MainWindow(QMainWindow):
         self.store = SettingsStore(home)
         self.controls = {"paused": False, "emergency": False}
         self.worker: SimWorker | None = None
+        self.check_worker: CheckWorker | None = None
+        self.paper_worker: PaperWorker | None = None
         self.log_dir: Path | None = None
         self.setWindowTitle(f"초단타 데이트레이딩 v{__version__} · 모의투자")
         self.resize(1180, 760)
@@ -243,7 +315,8 @@ class MainWindow(QMainWindow):
         self.mode.setStyleSheet("background:#1f6b4a; color:white; padding:6px 10px; font-weight:700;")
         self.pnl = QLabel("오늘 손익 0원")
         self.pnl.setObjectName("pnlUp")
-        self.budget = QLabel("손실 한도까지 1,000,000원")
+        limit = self.store.load().daily_loss_limit_krw
+        self.budget = QLabel(f"손실 한도까지 {limit:,}원")
         self.budget.setObjectName("muted")
         row.addWidget(self.mode)
         row.addWidget(self.pnl, 1)
@@ -265,8 +338,15 @@ class MainWindow(QMainWindow):
         self.sim_button = QPushButton("시뮬레이션 실행")
         self.sim_button.setObjectName("go")
         self.sim_button.clicked.connect(self.start_sim)
+        self.check_button = QPushButton("모의투자 연결 확인")
+        self.check_button.clicked.connect(self.start_check)
+        self.paper_button = QPushButton("모의투자 시작")
+        self.paper_button.setObjectName("go")
+        self.paper_button.clicked.connect(self.start_paper)
         tools.addWidget(self.sim_button)
-        tools.addWidget(QLabel("키 없이 진입·불타기·손절·익절·시간청산·장 마감 청산·하루 손실 한도를 재현합니다."))
+        tools.addWidget(self.check_button)
+        tools.addWidget(self.paper_button)
+        tools.addWidget(QLabel("연결 확인은 토큰과 시세만 보고 주문하지 않습니다. 모의투자 시작은 모의 서버로만 주문합니다."))
         tools.addStretch(1)
         layout.addLayout(tools)
         self.summary = QTextEdit()
@@ -317,6 +397,76 @@ class MainWindow(QMainWindow):
         self.controls["emergency"] = True
         self.statusBar().showMessage("긴급 청산을 요청했습니다. 진행 중인 시뮬레이션은 다음 초에 전량 시장가입니다.")
 
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self.paper_worker and self.paper_worker.isRunning():
+            self.paper_worker.stop()
+        super().closeEvent(event)
+
+    def _busy(self) -> bool:
+        return any(
+            worker is not None and worker.isRunning()
+            for worker in (self.worker, self.check_worker, self.paper_worker)
+        )
+
+    def start_check(self) -> None:
+        if self._busy():
+            return
+        try:
+            settings = self.store.load()
+        except SettingsError as exc:
+            QMessageBox.warning(self, "설정", "\n".join(exc.errors))
+            return
+        self.check_button.setEnabled(False)
+        self.check_worker = CheckWorker(self.home, settings)
+        self.check_worker.finished_ok.connect(self._check_done)
+        self.check_worker.failed.connect(self._check_failed)
+        self.check_worker.start()
+
+    def _check_done(self, message: str) -> None:
+        self.check_button.setEnabled(True)
+        self.statusBar().showMessage(message)
+        self.summary.append(message)
+
+    def _check_failed(self, message: str) -> None:
+        self.check_button.setEnabled(True)
+        self.statusBar().showMessage(message)
+        QMessageBox.warning(self, "모의투자 연결 확인", message)
+
+    def start_paper(self) -> None:
+        if self._busy():
+            return
+        answer = QMessageBox.question(
+            self,
+            "모의투자 시작",
+            "키움 모의투자 서버에 접속해 시세를 받고, 조건이 맞으면 모의 주문만 보냅니다. 실전 주문은 나가지 않습니다. 시작할까요?",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            settings = self.store.load()
+        except SettingsError as exc:
+            QMessageBox.warning(self, "설정", "\n".join(exc.errors))
+            return
+        self.controls["paused"] = False
+        self.controls["emergency"] = False
+        self.stop_button.setText("매매 중지")
+        self.paper_button.setEnabled(False)
+        self.paper_button.setText("모의투자 접속 중…")
+        self.paper_worker = PaperWorker(self.home, settings, self.controls)
+        self.paper_worker.finished_ok.connect(self._paper_done)
+        self.paper_worker.failed.connect(self._paper_failed)
+        self.paper_worker.start()
+
+    def _paper_done(self, folder: str) -> None:
+        self.paper_button.setEnabled(True)
+        self.paper_button.setText("모의투자 시작")
+        self.statusBar().showMessage(f"모의투자 로그: {folder}")
+
+    def _paper_failed(self, message: str) -> None:
+        self.paper_button.setEnabled(True)
+        self.paper_button.setText("모의투자 시작")
+        QMessageBox.warning(self, "모의투자", message)
+
     def start_sim(self) -> None:
         if self.worker and self.worker.isRunning():
             return
@@ -350,14 +500,21 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "시뮬레이션", message)
 
     def _show_board(self, board: dict) -> None:
-        pnl = int(board["pnl"])
-        self.pnl.setText(f"오늘 손익 {pnl:,}원")
-        self.pnl.setObjectName("pnlUp" if pnl >= 0 else "pnlDown")
+        settings = self.store.load()
+        summaries = board.get("summaries") or []
+        if len(summaries) > 1:
+            self.pnl.setText("시나리오별 손익")
+            self.pnl.setObjectName("pnlUp")
+            parts = [f"{item['scenario']} {int(item['pnl_krw']):,}원" for item in summaries]
+            self.budget.setText(" · ".join(parts))
+        else:
+            pnl = int(summaries[0]["pnl_krw"]) if summaries else int(board.get("pnl") or 0)
+            self.pnl.setText(f"오늘 손익 {pnl:,}원")
+            self.pnl.setObjectName("pnlUp" if pnl >= 0 else "pnlDown")
+            left = settings.daily_loss_limit_krw + pnl
+            self.budget.setText(f"손실 한도까지 {left:,}원")
         self.pnl.style().unpolish(self.pnl)
         self.pnl.style().polish(self.pnl)
-        settings = self.store.load()
-        left = settings.daily_loss_limit_krw + pnl
-        self.budget.setText(f"손실 한도까지 {left:,}원")
         self.summary.setPlainText(board["text"])
         self._fill(self.quote_table, [[q["code"], q["name"], f"{q['price']:,}", q["direction"]] for q in board["quotes"]])
         self._fill(
@@ -387,9 +544,9 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem(value)
                 if c == 3 and table is self.quote_table:
                     if value == "상승":
-                        item.setForeground(Qt.GlobalColor.green)
-                    elif value == "하락":
                         item.setForeground(Qt.GlobalColor.red)
+                    elif value == "하락":
+                        item.setForeground(Qt.GlobalColor.blue)
                 table.setItem(r, c, item)
         table.resizeColumnsToContents()
 

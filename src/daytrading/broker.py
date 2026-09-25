@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from daytrading.models import Fill, Intent, OrderRecord, Snapshot
-from daytrading.settings import Settings, tick_size
+from daytrading.settings import Settings, clamp_to_market, tick_size
 
 
 class MockBroker:
@@ -28,9 +28,15 @@ class MockBroker:
         )
         if status != "filled" or price is None:
             return record, None
+        price = clamp_to_market(price, snap.prev_close, settings)
+        trigger = intent.trigger_price or (intent.limit_price if intent.side == "buy" else snap.price)
         notional = price * intent.qty
         fee = int(round(notional * settings.commission_rate_pct / 100))
         tax = int(round(notional * settings.sell_tax_rate_pct / 100)) if intent.side == "sell" else 0
+        if intent.side == "sell":
+            slip = (trigger - price) * intent.qty if trigger else 0
+        else:
+            slip = (price - trigger) * intent.qty if trigger else 0
         fill = Fill(
             order_id=order_id,
             ts=snap.ts,
@@ -42,6 +48,8 @@ class MockBroker:
             price=price,
             fee_krw=fee,
             tax_krw=tax,
+            trigger_price=trigger,
+            slippage_krw=slip,
         )
         return record, fill
 

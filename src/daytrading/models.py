@@ -154,6 +154,7 @@ class Intent:
     limit_price: int
     amount_krw: int
     note: str = ""
+    trigger_price: int = 0
 
     @property
     def priority(self) -> int:
@@ -179,12 +180,15 @@ class Position:
     high_since_entry: int
     partial_done: bool = False
     breakeven_armed: bool = False
+    breakeven_basis: tuple[int, int] | None = None
     time_stop_cleared: bool = False
     vi_seen: bool = False
     vi_released_at: datetime | None = None
     vi_exit_bar_start: datetime | None = None
     schedule_partial_done: bool = False
     round_realized_krw: int = 0
+    bought_krw: int = 0
+    filled_order_ids: set[str] = field(default_factory=set)
     market: str = "KOSDAQ"
 
     @property
@@ -223,6 +227,8 @@ class Fill:
     fee_krw: int
     tax_krw: int
     realized_delta_krw: int = 0
+    trigger_price: int = 0
+    slippage_krw: int = 0
 
 
 @dataclass
@@ -237,9 +243,42 @@ class Portfolio:
     paused: bool = False
     emergency: bool = False
     pending_buys: set[str] = field(default_factory=set)
+    pending_buy_amount: dict[str, int] = field(default_factory=dict)
     pending_sells: set[str] = field(default_factory=set)
+    pending_sell_qty: dict[str, int] = field(default_factory=dict)
     traded_today: set[str] = field(default_factory=set)
+    bought_today: dict[str, int] = field(default_factory=dict)
     closed_trade_pnls: list[int] = field(default_factory=list)
 
+    def held_codes(self) -> set[str]:
+        return {code for code, position in self.positions.items() if position.qty > 0}
+
     def open_count(self) -> int:
-        return sum(1 for position in self.positions.values() if position.qty > 0) + len(self.pending_buys)
+        """이미 잡힌 슬롯. 보유 종목과, 아직 보유가 아닌 대기 매수만 센다."""
+        pending_new = {code for code in self.pending_buys if code not in self.held_codes()}
+        return len(self.held_codes() | pending_new)
+
+    def projected_entries(self, code: str) -> int:
+        """이 신규 매수까지 포함했을 때의 슬롯. 자기 대기 주문은 한 번만 센다."""
+        held = self.held_codes()
+        others = {item for item in self.pending_buys if item not in held and item != code}
+        incoming = 0 if code in held else 1
+        return len(held) + len(others) + incoming
+
+    def sell_room(self, code: str) -> int:
+        position = self.positions.get(code)
+        if position is None or position.qty <= 0:
+            return 0
+        return max(0, position.qty - self.pending_sell_qty.get(code, 0))
+
+    def hold_sell(self, code: str, qty: int) -> None:
+        self.pending_sell_qty[code] = self.pending_sell_qty.get(code, 0) + qty
+        self.pending_sells.add(code)
+
+    def free_sell(self, code: str, qty: int) -> None:
+        left = self.pending_sell_qty.get(code, 0) - qty
+        if left <= 0:
+            self.pending_sell_qty.pop(code, None)
+            self.pending_sells.discard(code)
+        else:
+            self.pending_sell_qty[code] = left

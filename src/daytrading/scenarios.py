@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 from daytrading.models import SymbolMeta
-from daytrading.settings import default_settings, tick_size
+from daytrading.settings import clamp_to_market, default_settings, tick_size
 from daytrading.timeutil import parse_stamp
 
 SIM_DAY = date(2026, 9, 25)
@@ -61,7 +61,10 @@ class Tape:
     ) -> None:
         self.acc += delta
         settings = default_settings()
+        price = clamp_to_market(price, self.meta.prev_close, settings)
         tick = tick_size(settings, price)
+        bid = clamp_to_market(max(1, price - tick), self.meta.prev_close, settings)
+        ask = clamp_to_market(price + tick, self.meta.prev_close, settings)
         self.ticks.append(
             Tick(
                 ts=parse_stamp(SIM_DAY, stamp),
@@ -69,8 +72,8 @@ class Tape:
                 price=price,
                 acc_value=self.acc,
                 strength=strength,
-                best_bid=max(1, price - tick),
-                best_ask=price + tick,
+                best_bid=bid,
+                best_ask=ask,
                 bid_qty=bid_qty,
                 ask_qty=ask_qty,
                 vi_active=vi_active,

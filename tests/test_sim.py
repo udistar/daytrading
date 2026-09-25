@@ -29,6 +29,9 @@ def test_builtin_session_covers_the_trading_loop(tmp_path):
     assert "VI 해제 후 대기" in reasons
     fills = _rows(tmp_path / "fills.csv")
     assert fills
+    assert "trigger_price" in fills[0]
+    assert "slippage_krw" in fills[0]
+    assert any(row["trigger_price"] for row in fills)
     assert (tmp_path / "summary.txt").read_text(encoding="utf-8")
     books = _rows(tmp_path / "orderbook.csv")
     assert "bid_ask_ratio" in books[0]

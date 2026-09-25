@@ -122,6 +122,7 @@ def maybe_entry(snap: Snapshot, settings: Settings, portfolio: Portfolio) -> Int
         limit_price=limit_price,
         amount_krw=limit_price * qty,
         note="매도1호가+틱 지정가 IOC",
+        trigger_price=limit_price,
     )
 
 
@@ -143,14 +144,30 @@ def _trail_stop(position: Position, price: int, settings: Settings) -> int:
 
 def _update_position_marks(position: Position, snap: Snapshot, settings: Settings) -> None:
     position.high_since_entry = max(position.high_since_entry, snap.price)
-    if snap.price >= _pct(position.avg_price, settings.breakeven_arm_pct):
+    basis = (position.qty, position.fill_notional)
+    reached = snap.price >= _pct(position.avg_price, settings.breakeven_arm_pct)
+    if basis != position.breakeven_basis:
+        # 추가 매수로 평균가가 바뀌면 예전 평균으로 켜 둔 본전 스톱을 다시 판단한다.
+        # 새 본전가가 현재가보다 위면 그 가격에 바로 팔지 않고 끈다.
+        position.breakeven_basis = basis
+        position.breakeven_armed = reached
+        if position.breakeven_armed:
+            be_price = _floor_price(_pct(position.avg_price, settings.breakeven_stop_pct))
+            if be_price > snap.price:
+                position.breakeven_armed = False
+    elif reached:
         position.breakeven_armed = True
     if position.high_since_entry >= _pct(position.entry_price, settings.time_stop_min_gain_pct):
         position.time_stop_cleared = True
     if snap.vi_active:
         position.vi_seen = True
-    if position.vi_seen and not snap.vi_active and position.vi_released_at is None:
-        position.vi_released_at = snap.vi_released_at or snap.ts
+        if position.vi_released_at is not None:
+            position.vi_released_at = None
+            position.vi_exit_bar_start = None
+    elif snap.vi_released_at is not None and position.vi_released_at != snap.vi_released_at:
+        position.vi_seen = True
+        position.vi_released_at = snap.vi_released_at
+        position.vi_exit_bar_start = None
 
 
 def maybe_exit(snap: Snapshot, position: Position, settings: Settings) -> Intent | None:
@@ -165,38 +182,40 @@ def maybe_exit(snap: Snapshot, position: Position, settings: Settings) -> Intent
     trail_price = _trail_stop(position, snap.price, settings)
     if snap.price <= max(hard_price, trail_price):
         reason = "trail" if trail_price > hard_price else hard_reason
-        return _sell_all(snap, position, reason, f"기준 {max(hard_price, trail_price)}")
+        level = max(hard_price, trail_price)
+        return _sell_all(snap, position, reason, f"기준 {level}", trigger=level)
 
     if (
         not position.time_stop_cleared
         and seconds_between(snap.ts, position.opened_at) >= settings.time_stop_seconds
     ):
-        return _sell_all(snap, position, "time_stop", "진입 후 목표 상승 미달")
+        return _sell_all(snap, position, "time_stop", "진입 후 목표 상승 미달", trigger=snap.price)
 
     if settings.vi_exit_on_down_bar and position.vi_released_at is not None and position.vi_exit_bar_start is None:
         bar = first_completed_bar_after(snap, position.vi_released_at)
         if bar is not None:
             position.vi_exit_bar_start = bar.start
             if bar.down:
-                return _sell_all(snap, position, "vi_exit", "VI 해제 후 첫 1분봉 음봉")
+                return _sell_all(snap, position, "vi_exit", "VI 해제 후 첫 1분봉 음봉", trigger=snap.price)
 
     if now >= settings.clock("hard_cutoff"):
-        return _sell_all(snap, position, "hard_cutoff", "09:50 전량")
+        return _sell_all(snap, position, "hard_cutoff", "09:50 전량", trigger=snap.price)
     if now >= settings.clock("market_flat_time"):
-        return _sell_all(snap, position, "market_flat", "잔량 시장가")
+        return _sell_all(snap, position, "market_flat", "잔량 시장가", trigger=snap.price)
     if now >= settings.clock("partial_flat_start") and not position.schedule_partial_done:
         qty = int(position.qty * settings.partial_flat_ratio_pct / 100)
         if qty >= position.qty or qty <= 0:
             position.schedule_partial_done = True
-            return _sell_all(snap, position, "schedule_flat", "분할 청산 전량")
+            return _sell_all(snap, position, "schedule_flat", "분할 청산 전량", trigger=snap.price)
         position.schedule_partial_done = True
-        return _sell(snap, position, "schedule_flat", qty, "분할 청산")
+        return _sell(snap, position, "schedule_flat", qty, "분할 청산", trigger=snap.price)
 
     if not position.partial_done and snap.price >= _pct(position.avg_price, settings.partial_tp_pct):
         qty = int(position.qty * settings.partial_tp_ratio_pct / 100)
         if 0 < qty < position.qty:
             position.partial_done = True
-            return _sell(snap, position, "partial_tp", qty, "부분 익절")
+            level = _floor_price(_pct(position.avg_price, settings.partial_tp_pct))
+            return _sell(snap, position, "partial_tp", qty, "부분 익절", trigger=level)
     return None
 
 
@@ -225,7 +244,7 @@ def add_block_reason(snap: Snapshot, position: Position, settings: Settings) -> 
         return "추가 매수 가격 미달"
     if seconds_between(snap.ts, position.last_buy_at) < settings.add_min_seconds:
         return "추가 매수 간격"
-    if settings.add_require_new_high and snap.price < snap.session_high_before:
+    if settings.add_require_new_high and snap.price <= snap.session_high_before:
         return "신고가 갱신 아님"
     if snap.strength is not None and snap.strength < settings.add_block_strength_below:
         return "체결강도 급락"
@@ -233,14 +252,14 @@ def add_block_reason(snap: Snapshot, position: Position, settings: Settings) -> 
         return "추가 체결강도 부족"
     if settings.add_require_profit and snap.price <= position.avg_price:
         return "이익 상태 아님"
-    bars = snap.completed_bars
+    bars = list(snap.completed_bars)
     need = int(settings.add_down_bars)
     if len(bars) >= need and all(bar.down for bar in bars[-need:]):
         return "연속 음봉"
     if bars and bars[-1].upper_wick_ratio >= settings.long_wick_ratio and bars[-1].high > bars[-1].low:
         return "긴 윗꼬리"
-    if snap.prev_minute_value and snap.prev_minute_value > 0:
-        dropped = (1 - snap.minute_value / snap.prev_minute_value) * 100
+    if len(bars) >= 2 and bars[-2].value > 0:
+        dropped = (1 - bars[-1].value / bars[-2].value) * 100
         if dropped >= settings.minute_value_drop_block_pct:
             return "1분 거래대금 급감"
     if _near_vi(snap, settings):
@@ -274,14 +293,15 @@ def maybe_add(snap: Snapshot, position: Position, settings: Settings) -> Intent 
         limit_price=limit_price,
         amount_krw=limit_price * qty,
         note=f"{level}회차",
+        trigger_price=limit_price,
     )
 
 
-def _sell_all(snap: Snapshot, position: Position, reason: str, note: str) -> Intent:
-    return _sell(snap, position, reason, position.qty, note)
+def _sell_all(snap: Snapshot, position: Position, reason: str, note: str, trigger: int = 0) -> Intent:
+    return _sell(snap, position, reason, position.qty, note, trigger=trigger)
 
 
-def _sell(snap: Snapshot, position: Position, reason: str, qty: int, note: str) -> Intent:
+def _sell(snap: Snapshot, position: Position, reason: str, qty: int, note: str, trigger: int = 0) -> Intent:
     return Intent(
         code=snap.code,
         name=snap.name,
@@ -292,6 +312,7 @@ def _sell(snap: Snapshot, position: Position, reason: str, qty: int, note: str) 
         limit_price=0,
         amount_krw=snap.price * qty,
         note=note,
+        trigger_price=trigger or snap.price,
     )
 
 
@@ -308,11 +329,16 @@ def evaluate(snap: Snapshot, portfolio: Portfolio, settings: Settings) -> tuple[
     position = portfolio.positions.get(snap.code)
     rejections: list[tuple[str, str]] = []
     if position and position.qty > 0:
-        if snap.code in portfolio.pending_sells:
+        room = portfolio.sell_room(snap.code)
+        if room <= 0:
             return [], rejections
         exit_intent = maybe_exit(snap, position, settings)
         if exit_intent:
-            return [exit_intent], rejections
+            exit_intent.qty = min(exit_intent.qty, room)
+            if exit_intent.qty >= 1:
+                return [exit_intent], rejections
+        if portfolio.pending_sell_qty.get(snap.code, 0) > 0:
+            return [], rejections
         if snap.code in portfolio.pending_buys:
             return [], rejections
         blocked = add_block_reason(snap, position, settings)

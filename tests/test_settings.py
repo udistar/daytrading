@@ -152,6 +152,26 @@ def test_save_roundtrip_and_history(tmp_path):
     assert len(store.history()) == 1
 
 
+def test_price_band_and_corrupt_settings_file(tmp_path):
+    from daytrading.settings import clamp_to_market, price_band
+    from daytrading.scenarios import Tape, _meta
+
+    settings = default_settings()
+    assert price_band(10_000, settings) == (7_000, 13_000)
+    assert clamp_to_market(6_000, 10_000, settings) == 7_000
+    assert clamp_to_market(10_555, 10_000, settings) == 10_550
+    tape = Tape(_meta("096770", "갭"))
+    tape.add("09:08:00", 6_000, 0)
+    tick = tape.ticks[-1]
+    assert tick.price == 7_000
+    assert 7_000 <= tick.best_bid <= 13_000
+    assert 7_000 <= tick.best_ask <= 13_000
+    store = SettingsStore(tmp_path)
+    (tmp_path / "settings.json").write_text("{", encoding="utf-8")
+    store.save(default_settings())
+    assert store.load().daily_loss_limit_krw == 1_000_000
+
+
 def test_tick_table():
     settings = default_settings()
     rules = parse_tick_rules(settings.tick_rules)

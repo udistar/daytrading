@@ -9,7 +9,7 @@ from daytrading.broker import MockBroker
 from daytrading.execution import OrderQueue, RateGate
 from daytrading.journal import Journal
 from daytrading.ledger import apply_fill
-from daytrading.market import Market
+from daytrading.market import Market, quote_snapshot
 from daytrading.models import Intent, Portfolio, Snapshot
 from daytrading.risk import mark_to_market, protection_intents, veto_buy
 from daytrading.settings import Settings
@@ -17,7 +17,7 @@ from daytrading.strategy import evaluate, phase_name
 
 
 class Engine:
-    def __init__(self, settings: Settings, journal: Journal, scenario: str):
+    def __init__(self, settings: Settings, journal: Journal, scenario: str, broker=None):
         self.settings = settings
         self.journal = journal
         self.journal.scenario = scenario
@@ -25,9 +25,8 @@ class Engine:
         self.portfolio = Portfolio(cash=settings.initial_capital_krw)
         self.queue = OrderQueue()
         self.gate = RateGate(settings)
-        self.broker = MockBroker()
+        self.broker = broker or MockBroker()
         self.prices: dict[str, int] = {}
-        self.noted: set[tuple[str, str, str]] = set()
         self._seq = 0
         self.fill_count = 0
         self.rejection_count = 0
@@ -35,24 +34,46 @@ class Engine:
         self._clock = datetime.now().astimezone()
 
     def enqueue(self, intent: Intent) -> None:
-        if intent.side == "buy" and intent.code in self.portfolio.pending_buys:
-            return
-        if intent.side == "sell" and intent.code in self.portfolio.pending_sells:
-            return
-        if intent.side == "buy":
-            self.portfolio.pending_buys.add(intent.code)
+        if intent.side == "sell":
+            self._cancel_buys(intent.code)
+            room = self.portfolio.sell_room(intent.code)
+            if room <= 0:
+                return
+            if intent.qty > room:
+                intent.qty = room
+                intent.amount_krw = max(intent.amount_krw, intent.qty)
+            self.portfolio.hold_sell(intent.code, intent.qty)
         else:
-            self.portfolio.pending_sells.add(intent.code)
+            if intent.code in self.portfolio.pending_buys:
+                return
+            self.portfolio.pending_buys.add(intent.code)
+            self.portfolio.pending_buy_amount[intent.code] = intent.amount_krw
         self.queue.push(intent)
         self.journal.signal(self._clock, intent.code, intent.reason, intent.note)
 
+    def _cancel_buys(self, code: str) -> None:
+        for pending in self.queue.cancel(code, "buy"):
+            self.portfolio.pending_buys.discard(code)
+            self.portfolio.pending_buy_amount.pop(code, None)
+            self.reject(self._clock, code, "buy", "청산으로 매수 취소", pending.reason)
+
     def reject(self, ts: datetime, code: str, side: str, reason: str, detail: str = "") -> None:
-        key = (code, side, reason)
-        if key in self.noted:
-            return
-        self.noted.add(key)
         self.rejection_count += 1
         self.journal.reject(ts, code, side, reason, detail)
+
+    def _release(self, intent: Intent) -> None:
+        if intent.side == "buy":
+            self.portfolio.pending_buys.discard(intent.code)
+            self.portfolio.pending_buy_amount.pop(intent.code, None)
+            return
+        self.portfolio.free_sell(intent.code, intent.qty)
+        position = self.portfolio.positions.get(intent.code)
+        if position is None:
+            return
+        if intent.reason == "partial_tp":
+            position.partial_done = False
+        if intent.reason == "schedule_flat":
+            position.schedule_partial_done = False
 
     def drain(self, now: datetime) -> None:
         self._clock = now
@@ -61,26 +82,45 @@ class Engine:
             self.portfolio.loss_halted = True
         for intent in protection_intents(self.portfolio, self.prices, self.settings, now, pnl):
             self.enqueue(intent)
+        deferred: list[Intent] = []
+        blocked_trs: set[str] = set()
         while self.queue:
             intent = self.queue.peek()
+            if intent is None:
+                break
+            if intent.tr_id in blocked_trs:
+                deferred.append(self.queue.pop())
+                continue
             snap = self._snap(intent.code, now)
             if intent.side == "buy":
                 veto = veto_buy(intent, self.portfolio, self.settings, snap, now, self._pnl())
                 if veto:
                     self.queue.pop()
-                    self.portfolio.pending_buys.discard(intent.code)
+                    self._release(intent)
                     self.reject(now, intent.code, intent.side, veto, intent.note)
                     continue
-            if snap is None or not self.gate.ready(intent.tr_id, now):
+            if snap is None and intent.side == "sell":
+                snap = self._synthetic_snap(intent, now)
+            if snap is None:
+                deferred.append(self.queue.pop())
+                continue
+            if not self.gate.bucket_ready(now):
                 break
+            if not self.gate.tr_ready(intent.tr_id, now):
+                blocked_trs.add(intent.tr_id)
+                deferred.append(self.queue.pop())
+                continue
             self.gate.take(intent.tr_id, now)
             self.queue.pop()
             self._seq += 1
             record, fill = self.broker.submit(f"{self._seq:04d}", intent, snap, self.settings)
             self.journal.order(record)
+            if record.status in {"accepted", "dry_run"}:
+                if record.status == "dry_run":
+                    self._release(intent)
+                continue
             if fill is None:
-                self.portfolio.pending_buys.discard(intent.code)
-                self.portfolio.pending_sells.discard(intent.code)
+                self._release(intent)
                 self.reject(now, intent.code, intent.side, "미체결 취소", intent.reason)
                 continue
             apply_fill(self.portfolio, fill, self.settings)
@@ -93,6 +133,8 @@ class Engine:
                 self.portfolio.loss_halted = True
             for extra in protection_intents(self.portfolio, self.prices, self.settings, now, pnl):
                 self.enqueue(extra)
+        for intent in deferred:
+            self.queue.push(intent)
 
     def _pnl(self) -> int:
         return mark_to_market(self.portfolio, self.prices, self.settings)
@@ -102,6 +144,16 @@ class Engine:
         if book is None:
             return None
         return book.snapshot(now, self.settings)
+
+    def _synthetic_snap(self, intent: Intent, now: datetime) -> Snapshot | None:
+        book = self.market.books.get(intent.code)
+        price = self.prices.get(intent.code, 0)
+        if price <= 0 and book is not None:
+            price = book.last_price
+        if price <= 0:
+            return None
+        prev_close = book.meta.prev_close if book is not None else 0
+        return quote_snapshot(intent.code, intent.name, now, price, prev_close)
 
     def summary(self) -> dict:
         pnl = self._pnl()

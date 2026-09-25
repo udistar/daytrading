@@ -22,6 +22,16 @@ def mark_to_market(portfolio: Portfolio, prices: dict[str, int], settings: Setti
     return portfolio.realized_krw + unrealized
 
 
+def _spent_on(portfolio: Portfolio, code: str) -> int:
+    """당일 누적 매수금액. 부분 매도로 보유 원가가 줄어도 한도는 돌아가지 않는다."""
+    remembered = portfolio.bought_today.get(code, 0)
+    position = portfolio.positions.get(code)
+    from_position = 0
+    if position is not None and position.qty > 0:
+        from_position = position.bought_krw or position.fill_notional
+    return max(remembered, from_position)
+
+
 def loss_budget_left(pnl: int, settings: Settings) -> int:
     return settings.daily_loss_limit_krw + pnl
 
@@ -62,21 +72,36 @@ def veto_buy(
         return "연속 손절 휴식"
     if now.time() >= settings.clock("hard_cutoff"):
         return "09:50 이후"
+    if intent.reason == "entry" and now.time() < settings.clock("entry_start"):
+        return "신규 진입 시간 전"
+    if intent.reason == "entry" and now.time() >= settings.clock("entry_end"):
+        return "신규 진입 마감"
+    if intent.reason == "add" and now.time() >= settings.clock("add_end"):
+        return "추가 매수 마감"
     if pnl <= -settings.daily_loss_limit_krw:
         return "하루 손실 한도"
     if intent.reason == "entry" and pnl <= -settings.loss_buffer_krw:
         return "손실 완충"
     if intent.reason == "add" and loss_budget_left(pnl, settings) < settings.add_min_remaining_budget_krw:
         return "남은 손실 여유 부족"
-    if intent.reason == "entry" and portfolio.open_count() >= settings.max_concurrent_holdings:
-        return "동시 보유 한도"
     position = portfolio.positions.get(intent.code)
-    buy_count = position.buy_count if position and position.qty > 0 else 0
+    holding = position is not None and position.qty > 0
+    if intent.reason == "add" and not holding:
+        return "보유 없는 추가 매수"
+    if intent.reason == "entry" and intent.code in portfolio.traded_today and not settings.allow_reentry_same_day:
+        return "당일 재진입 안 함"
+    if intent.reason == "entry" and portfolio.projected_entries(intent.code) > settings.max_concurrent_holdings:
+        return "동시 보유 한도"
+    buy_count = position.buy_count if holding else 0
     if buy_count >= settings.max_buys_per_stock:
         return "종목당 매수 횟수"
-    invested = position.fill_notional if position and position.qty > 0 else 0
+    invested = _spent_on(portfolio, intent.code)
     if invested + intent.amount_krw > settings.per_stock_cap_krw:
         return "종목당 금액 한도"
+    reserved = sum(amount for code, amount in portfolio.pending_buy_amount.items() if code != intent.code)
+    fee = int(round(intent.amount_krw * settings.commission_rate_pct / 100))
+    if reserved + intent.amount_krw + fee > portfolio.cash:
+        return "현금 부족"
     blocked = vi_buy_block(snap, settings, now)
     if blocked:
         return blocked
@@ -102,7 +127,8 @@ def note_closed_trade(portfolio: Portfolio, pnl: int, now: datetime, settings: S
 def liquidate_intents(portfolio: Portfolio, prices: dict[str, int], reason: str) -> list[Intent]:
     intents = []
     for position in portfolio.positions.values():
-        if position.qty <= 0 or position.code in portfolio.pending_sells:
+        room = portfolio.sell_room(position.code)
+        if room <= 0:
             continue
         price = prices.get(position.code, position.last_add_price)
         intents.append(
@@ -111,11 +137,12 @@ def liquidate_intents(portfolio: Portfolio, prices: dict[str, int], reason: str)
                 name=position.name,
                 side="sell",
                 reason=reason,
-                qty=position.qty,
+                qty=room,
                 order_type="market",
                 limit_price=0,
-                amount_krw=price * position.qty,
+                amount_krw=price * room,
                 note="위험 계층 강제 청산",
+                trigger_price=price,
             )
         )
     return intents
