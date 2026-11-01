@@ -1,0 +1,53 @@
+{
+  "disclaimer": "시뮬레이션이며 예측이 아닙니다.",
+  "cost_note": "비용 차감 후",
+  "symbol": "900001",
+  "name": "샘플전자",
+  "market": "KOSPI",
+  "plan_date": "2026-10-30",
+  "entry": 10000,
+  "entry_time": "09:10:00",
+  "stop": 9850,
+  "target": 10300,
+  "seed": 19,
+  "paths": 10000,
+  "window": 2,
+  "tic_scope": "5",
+  "until": "09:50:00",
+  "pool_sessions": 24,
+  "full_sessions_before_plan": 24,
+  "lookback_requested": 60,
+  "pool_note": "요청한 60세션보다 풀세션이 24개로 적습니다. 있는 풀세션만 사용합니다. 최소 개수는 넘었습니다.",
+  "planned_r_after_cost": 1.111728,
+  "monte_carlo": {
+    "target_first": 667,
+    "stop_first": 1590,
+    "neither": 7743,
+    "green": 5331,
+    "avg_r": 0.010027,
+    "breakeven_win_rate": 0.473546,
+    "target_rate_given_hit": 0.295525,
+    "diff_pp": -17.8021,
+    "close_percentiles": {
+      "p10": 9850.0,
+      "p25": 9994.4861,
+      "p50": 10070.3518,
+      "p75": 10149.5427,
+      "p90": 10224.9192
+    }
+  },
+  "history": {
+    "fired": 16,
+    "target_first": 8,
+    "stop_first": 8,
+    "neither": 0,
+    "avg_r": 0.079192
+  },
+  "verdict": "비용 차감 후, 손절·목표에 닿은 재현만 보면 목표 비율이 손익분기보다 15%p 이상 낮습니다. 시뮬레이션이며 예측이 아닙니다.",
+  "broker": "kiwoom-mock",
+  "tr": "ka11080",
+  "live_trading": false,
+  "unconfirmed": [
+    "분봉 조회가 며칠을 돌려주는지는 키움 공식 문서에서 확인하지 못했다."
+  ]
+}

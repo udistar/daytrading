@@ -39,6 +39,7 @@ from daytrading.settings import (
     SettingsStore,
     default_settings,
 )
+from daytrading.review_ui import GatePage, TimeMachinePage
 from daytrading.sim import load_dashboard, run_builtin
 
 STYLE = """
@@ -306,6 +307,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._desk(), "매매")
         self.settings_page = SettingsPage(self.store)
         self.tabs.addTab(self.settings_page, "설정")
+        self.time_machine_page = TimeMachinePage(self.store)
+        self.gate_page = GatePage(self.store)
+        self.tabs.addTab(self.time_machine_page, "Time Machine")
+        self.tabs.addTab(self.gate_page, "주문 승인")
         self.statusBar().showMessage("모의투자 모드. 실전 주소는 v0에서 잠겨 있습니다. 키가 없어도 시뮬레이션으로 전체를 돌릴 수 있습니다.")
 
     def _banner(self) -> QWidget:

@@ -137,3 +137,34 @@ py -3 -m daytrading --paper
 - 분봉이 비어 있는 분은 0으로 채우지 않습니다. 평균은 찍힌 분봉만 사용합니다.
 
 `--check` 로 토큰과 시세 등록을 확인할 수 있습니다. 실제 모의 계좌의 체결 품질은 사용자 키로 `--paper` 를 돌려 봐야 하고, 그 결과만으로 실전 사용을 권하지 않습니다.
+
+## Time Machine 과 주문 승인
+
+이 기능은 09:00~09:50 자동 매매와 따로입니다. `strategy.py`, `session.py`, `execution.py`, `risk.py` 의 기존 한도·시간 규칙은 바꾸지 않았습니다. 게이트를 그 자동 경로에 끼우는 일은 후속입니다.
+
+브로커는 **키움 REST 모의투자**(`https://mockapi.kiwoom.com`)입니다. 지시 원문에 KIS 모의투자가 있었으나, 이 저장소의 명세와 코드가 키움이라 키움을 따릅니다. KIS 어댑터는 넣지 않았습니다.
+
+**시뮬레이션 ≠ 예측.** Time Machine 은 과거 분봉을 재배열해 손절·목표가 먼저 닿는 횟수를 셀 뿐입니다. 수익이나 승률을 약속하지 않습니다. 실주문·결제·실전 주소는 사용하지 않습니다.
+
+키 없이 내장 가짜 분봉으로 돌립니다.
+
+```bat
+set PYTHONPATH=src
+py -3 -m daytrading --timemachine
+```
+
+화면에서는 **Time Machine** 탭의 **샘플 픽스처 실행** 입니다. 장중 루프에서 부르지 않습니다. 결과 JSON 과 화면 예시는 `docs/timemachine-sample.json`, `docs/timemachine-sample.png` 입니다. 설명은 `docs/timemachine.md` 에 있습니다.
+
+비용 기본값(설정 탭 **타임머신**에서 바꿉니다):
+
+| 항목 | 기본 | 출처 |
+|---|---|---|
+| 매수·매도 수수료 | 0.015% (비율 0.00015) | [키움 주식 FAQ](https://www.kiwoom.com/m/domestic/stock/VStockMainView) 현금주식. 본인 계좌 요율로 바꾸세요. |
+| 코스피 매도세 | 0.20% (거래세 0.05 + 농특세 0.15) | [증권거래세법 시행령](https://www.law.go.kr/LSW/lumLsLinkPop.do?chrClsCd=010202&lspttninfSeq=64014), [한투 안내](https://securities.koreainvestment.com/main/customer/notice/Notice.jsp?cmd=TF04ga000002&num=45935) |
+| 코스닥 매도세 | 0.20% (거래세 0.20) | 같은 안내 |
+| 슬리피지 | 2틱(편도) | 공식 세율이 아닙니다. |
+| 유관기관수수료 | 0 | 계좌·시점마다 달라 숫자를 넣지 않았습니다. |
+
+분봉 TR 은 정규장 [ka11080](https://openapi.kiwoom.com/guide/apiGuideContents/07/ka11080) 입니다. 며칠치를 주는지는 문서에 없습니다. 풀세션이 20개 미만이면 시뮬을 거절합니다.
+
+**주문 승인** 탭은 수동 주문용입니다. 위험 검사 PASS, 그 주문 번호만 「예」, Allow once 또는 Deny. 「항상 허용」은 없습니다. 세 단계 전에는 모의 기록도 남지 않습니다. 청산은 하루 손실 한도로 막지 않으며, 그 판단은 기존 `risk.py` 에 맡깁니다.
