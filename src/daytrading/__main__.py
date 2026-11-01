@@ -17,6 +17,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--paper", action="store_true", help="키움 모의투자 서버에 접속해 같은 매매 엔진을 돌립니다.")
     parser.add_argument("--dry-run", action="store_true", help="--paper 와 함께 쓰면 주문 API를 호출하지 않습니다. 단독이면 --check 와 같습니다.")
     parser.add_argument("--home", type=Path, default=None, help="설정·로그 폴더. 비우면 사용자 홈의 .daytrading")
+    parser.add_argument("--timemachine", action="store_true", help="가짜 분봉으로 Time Machine 을 돌립니다. 주문은 내지 않습니다.")
+    parser.add_argument("--fixture", type=Path, default=None, help="분봉 픽스처 JSON. 비우면 내장 샘플.")
+    parser.add_argument("--out", type=Path, default=None, help="Time Machine 결과 JSON 경로.")
+    parser.add_argument("--png", type=Path, default=None, help="Time Machine 화면 PNG 경로.")
     args = parser.parse_args(argv)
     home = args.home or default_home()
     try:
@@ -28,6 +32,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_check(home, settings)
     if args.paper:
         return _run_paper(home, settings, dry_run=args.dry_run)
+    if args.timemachine:
+        return _run_timemachine(home, settings, args.fixture, args.out, args.png)
     if args.sim:
         from daytrading.sim import render_report, run_builtin
 
@@ -40,6 +46,35 @@ def main(argv: list[str] | None = None) -> int:
     from daytrading.ui import launch
 
     return launch(home)
+
+
+def _run_timemachine(home: Path, settings, fixture: Path | None, out: Path | None, png: Path | None) -> int:
+    from daytrading.timemachine.engine import TimeMachineError, load_fixture, run_timemachine, write_result
+    from daytrading.timemachine.sample_data import packaged_fixture
+
+    source = fixture or packaged_fixture()
+    try:
+        bars, plan = load_fixture(source)
+        result = run_timemachine(bars, plan, settings)
+    except (TimeMachineError, OSError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    target = out or (home / "logs" / "timemachine-sample.json")
+    write_result(target, result)
+    print(result["verdict"])
+    print(result["cost_note"])
+    monte = result["monte_carlo"]
+    print(
+        f"목표 {monte['target_first']} 손절 {monte['stop_first']} 미결 {monte['neither']} "
+        f"green {monte['green']} avgR {monte['avg_r']}"
+    )
+    print(f"결과: {target}")
+    if png is not None:
+        from daytrading.review_ui import save_time_machine_png
+
+        save_time_machine_png(home, result, png)
+        print(f"화면: {png}")
+    return 0
 
 
 def _run_check(home: Path, settings) -> int:

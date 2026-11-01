@@ -148,6 +148,26 @@ SCHEMA: tuple[Field, ...] = (
         "2000:1,5000:5,20000:10,50000:50,200000:100,500000:500,1000000000:1000",
         help="예: 2000원 미만 1원. 매도1호가 +1틱 계산에 씁니다.",
     ),
+    _f("tm_tic_scope", "타임머신 분봉", "타임머신", "str", "5", help="1 또는 5. 키움 분봉 tic_scope. 기본은 5분."),
+    _f("tm_lookback_sessions", "타임머신 조회 세션 수", "타임머신", "int", 60, 20, 400, "요청 상한입니다. 분봉을 며칠이나 주는지는 문서에 없습니다."),
+    _f("tm_min_full_sessions", "타임머신 최소 풀세션", "타임머신", "int", 20, 20, 400, "이보다 적으면 시뮬을 거절합니다."),
+    _f("tm_paths", "타임머신 재현 횟수", "타임머신", "int", 10_000, 1, 100_000),
+    _f("tm_seed", "타임머신 시드", "타임머신", "int", 19, 0, 2_000_000_000),
+    _f("tm_window", "타임머신 시각 창 (봉)", "타임머신", "int", 2, 0, 30, "같은 시각 ±이 봉 수에서 과거 봉을 고릅니다."),
+    _f("tm_session_open", "타임머신 정규장 시작", "타임머신", "time", "09:00:00"),
+    _f("tm_until", "타임머신 청산 시각", "타임머신", "time", "09:50:00", help="이 시각 전에 시작한 봉까지만 걷습니다. 기본은 강제청산 시각."),
+    _f("tm_session_close", "타임머신 정규장 끝", "타임머신", "time", "15:30:00", help="풀세션은 이 시각까지 분봉이 빠짐없이 있는 날입니다."),
+    _f("tm_breakout_lookback_min", "타임머신 돌파 구간 (분)", "타임머신", "int", 5, 1, 60, "히스토리 발동: 직전 N분 고가 돌파. 실시간 전략 코드와 따로입니다."),
+    _f("tm_opening_range_min", "타임머신 시가 범위 (분)", "타임머신", "int", 5, 1, 60),
+    _f("tm_use_opening_range", "타임머신 시가 범위 사용", "타임머신", "bool", True),
+    _f("tm_run_montecarlo", "타임머신 몬테카를로", "타임머신", "bool", True),
+    _f("tm_run_history", "타임머신 히스토리", "타임머신", "bool", True),
+    _f("tm_buy_fee_pct", "타임머신 매수 수수료 (%, 편도)", "타임머신", "float", 0.015, 0.0, 2.0, "0.015% = 비율 0.00015. 키움 FAQ 현금주식.", 4),
+    _f("tm_sell_fee_pct", "타임머신 매도 수수료 (%, 편도)", "타임머신", "float", 0.015, 0.0, 2.0, "0.015% = 비율 0.00015.", 4),
+    _f("tm_kospi_tax_pct", "타임머신 코스피 매도세 (%)", "타임머신", "float", 0.20, 0.0, 2.0, "0.20% = 거래세 0.05 + 농특세 0.15.", 4),
+    _f("tm_kosdaq_tax_pct", "타임머신 코스닥 매도세 (%)", "타임머신", "float", 0.20, 0.0, 2.0, "0.20% = 거래세 0.20.", 4),
+    _f("tm_related_fee_pct", "타임머신 유관기관수수료 (%, 편도)", "타임머신", "float", 0.0, 0.0, 2.0, "기본 0. 면제 여부는 계좌마다 달라 숫자를 추측하지 않습니다.", 4),
+    _f("tm_slippage_ticks", "타임머신 슬리피지 (틱, 편도)", "타임머신", "int", 2, 0, 20, "공식 세율이 아닙니다. 불리한 체결 가정."),
 )
 
 FIELDS = {field.key: field for field in SCHEMA}
@@ -369,6 +389,21 @@ def validate_settings(raw: dict[str, Any]) -> Settings:
         parse_tick_rules(settings.tick_rules)
     except ValueError as exc:
         range_errors.append(f"호가 단위: {exc}")
+    if str(settings.tm_tic_scope) not in {"1", "5"}:
+        range_errors.append("타임머신 분봉은 1 또는 5만 선택할 수 있습니다.")
+    if settings.tm_min_full_sessions > settings.tm_lookback_sessions:
+        range_errors.append("타임머신 최소 풀세션은 조회 세션 수보다 클 수 없습니다.")
+    try:
+        session_open = settings.clock("tm_session_open")
+        session_close = settings.clock("tm_session_close")
+        until = settings.clock("tm_until")
+    except ValueError:
+        range_errors.append("타임머신 시각이 올바르지 않습니다.")
+    else:
+        if not (session_open < until <= session_close):
+            range_errors.append("타임머신 청산 시각은 정규장 시작 뒤, 정규장 끝 이전이어야 합니다.")
+        if session_open >= session_close:
+            range_errors.append("타임머신 정규장 시작은 끝보다 빨라야 합니다.")
     if range_errors:
         raise SettingsError(range_errors)
     return settings
