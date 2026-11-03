@@ -324,8 +324,29 @@ def crossed_breakout(snap: Snapshot) -> bool:
     )
 
 
-def evaluate(snap: Snapshot, portfolio: Portfolio, settings: Settings) -> tuple[list[Intent], list[tuple[str, str]]]:
-    """의도와, 돌파했는데 필터에 걸린 (코드, 사유) 목록을 돌려준다."""
+def remember_entry_rejection(seen: dict, ts: datetime, code: str, reason: str) -> bool:
+    """같은 종목·같은 사유는 1분에 한 번만 남긴다. 새로 적을 사유면 True."""
+    minute = ts.replace(second=0, microsecond=0)
+    for key in [key for key in seen if key[2] != minute]:
+        del seen[key]
+    mark = (code, reason, minute)
+    if mark in seen:
+        return False
+    seen[mark] = True
+    return True
+
+
+def evaluate(
+    snap: Snapshot,
+    portfolio: Portfolio,
+    settings: Settings,
+    seen: dict | None = None,
+) -> tuple[list[Intent], list[tuple[str, str]]]:
+    """의도와, 신규 매수가 막힌 (코드, 사유) 목록을 돌려준다.
+
+    돌파 여부와 상관없이 entry_block_reason 을 남긴다.
+    seen 을 넘기면 종목·사유·분마다 한 번만 넣는다.
+    """
     position = portfolio.positions.get(snap.code)
     rejections: list[tuple[str, str]] = []
     if position and position.qty > 0:
@@ -353,11 +374,11 @@ def evaluate(snap: Snapshot, portfolio: Portfolio, settings: Settings) -> tuple[
         return [], rejections
     if snap.code in portfolio.pending_buys:
         return [], rejections
-    if crossed_breakout(snap):
-        blocked = entry_block_reason(snap, settings, portfolio)
-        if blocked:
+    blocked = entry_block_reason(snap, settings, portfolio)
+    if blocked:
+        if seen is None or remember_entry_rejection(seen, snap.ts, snap.code, blocked):
             rejections.append((snap.code, blocked))
-            return [], rejections
+        return [], rejections
     entry = maybe_entry(snap, settings, portfolio)
     return ([entry] if entry else []), rejections
 

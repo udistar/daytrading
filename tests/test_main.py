@@ -14,6 +14,15 @@ def test_check_cli_does_not_place_orders(tmp_path, capsys, monkeypatch):
     assert main(["--dry-run", "--home", str(tmp_path)]) == 0
 
 
+def test_paper_cli_returns_zero_when_the_loop_returns(tmp_path, monkeypatch, capsys):
+    for key in ("KIWOOM_APP_KEY", "KIWOOM_APP_SECRET", "KIWOOM_ACCOUNT_NO"):
+        monkeypatch.delenv(key, raising=False)
+    (tmp_path / "secrets.env").write_text("KIWOOM_APP_KEY=k\nKIWOOM_APP_SECRET=s\n", encoding="utf-8")
+    monkeypatch.setattr("daytrading.paper.run_paper", lambda *args, **kwargs: None)
+    assert main(["--paper", "--home", str(tmp_path)]) == 0
+    assert "mockapi.kiwoom.com" in capsys.readouterr().out
+
+
 def test_sim_cli_prints_a_report(tmp_path, capsys):
     code = main(["--sim", "--home", str(tmp_path)])
     assert code == 0

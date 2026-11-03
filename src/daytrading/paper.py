@@ -24,7 +24,7 @@ from daytrading.kiwoom import (
     ws_reg_packet,
 )
 from daytrading.ledger import apply_fill
-from daytrading.meta import FLAG_FIELDS, load_symbol_meta
+from daytrading.meta import FLAG_FIELDS, load_symbol_meta, refresh_symbol_meta
 from daytrading.models import Fill, Intent, OrderRecord, Snapshot, SymbolMeta
 from daytrading.secrets import load_secrets, missing_secret_names
 from daytrading.session import Engine
@@ -320,10 +320,14 @@ def run_paper(
     controls: dict | None = None,
     should_stop: Callable[[], bool] | None = None,
     clock: Callable[[], datetime] | None = None,
+    sleeper: Callable[[float], None] | None = None,
 ) -> Engine:
     """모의투자 시세를 같은 엔진에 넣고, dry_run이 아니면 모의 주문만 전송한다."""
     client = KiwoomClient(app_key, app_secret, mode="paper", opener=opener)
     client.issue_token()
+    now_fn = clock or _now
+    if meta_path is not None:
+        refresh_symbol_meta(client, meta_path, now_fn().date(), sleeper=sleeper)
     broker = KiwoomBroker(client, dry_run=dry_run)
     engine = Engine(settings, journal, "paper", broker=broker)
     pinned = codes is not None
@@ -337,7 +341,8 @@ def run_paper(
         if watched:
             sock.send(json.dumps(ws_reg_packet(watched, ["0B", "0D", "1h", "00"])))
         _send_conditions(sock, settings)
-        last_rank_at = (clock or _now)()
+        last_rank_at = now_fn()
+        seen: dict = {}
         loops = 0
         while max_loops is None or loops < max_loops:
             if should_stop and should_stop():
@@ -350,7 +355,7 @@ def run_paper(
             if not raw:
                 break
             message = _message(raw)
-            now = (clock or _now)()
+            now = now_fn()
             if not pinned and (now - last_rank_at).total_seconds() >= float(settings.ranking_poll_seconds):
                 watched = _select_codes(client, settings, None)
                 _watch(engine, watched, meta_path)
@@ -363,8 +368,10 @@ def run_paper(
                     engine.portfolio.emergency = True
             for reply in apply_realtime(engine, message, now):
                 sock.send(reply)
-            _evaluate_dirty(engine, now)
+            _evaluate_dirty(engine, now, seen)
             engine.drain(now)
+            if now.time() >= settings.clock("hard_cutoff") and not _open_positions(engine):
+                break
     finally:
         close = getattr(sock, "close", None)
         if close:
@@ -372,7 +379,11 @@ def run_paper(
     return engine
 
 
-def _evaluate_dirty(engine: Engine, now: datetime) -> None:
+def _open_positions(engine: Engine) -> bool:
+    return any(position.qty > 0 for position in engine.portfolio.positions.values())
+
+
+def _evaluate_dirty(engine: Engine, now: datetime, seen: dict) -> None:
     from daytrading.strategy import evaluate
 
     for code, book in list(engine.market.books.items()):
@@ -383,7 +394,7 @@ def _evaluate_dirty(engine: Engine, now: datetime) -> None:
             continue
         if book.dirty:
             engine.journal.orderbook(snap)
-        intents, blocked = evaluate(snap, engine.portfolio, engine.settings)
+        intents, blocked = evaluate(snap, engine.portfolio, engine.settings, seen=seen)
         book.prev_price = book.last_price
         book.dirty = False
         for blocked_code, reason in blocked:
