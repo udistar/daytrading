@@ -31,6 +31,7 @@ TR_TOKEN = "au10001"
 TR_VOLUME_SURGE = "ka10023"
 TR_CHANGE_RANK = "ka10027"
 TR_STOCK_INFO = "ka10001"
+TR_SYMBOL_LIST = "ka10099"
 TR_CONDITION_LIST = "ka10171"
 TR_CONDITION_REAL = "ka10173"
 TR_CONDITION_STOP = "ka10174"
@@ -252,6 +253,14 @@ def parse_real_messages(message: dict[str, Any]) -> list[dict[str, Any]]:
     return events
 
 
+def _response_headers(response: Any) -> dict[str, str]:
+    raw = getattr(response, "headers", None)
+    if raw is None:
+        return {}
+    items = raw.items() if hasattr(raw, "items") else ()
+    return {str(key).lower(): str(value) for key, value in items}
+
+
 def _float(value: Any) -> float | None:
     if value is None or str(value).strip() == "":
         return None
@@ -298,21 +307,57 @@ class KiwoomClient:
         return self._post(RANK_PATH, change_rank_body(), api_id=TR_CHANGE_RANK, auth=True)
 
     def stock_info(self, code: str) -> dict[str, Any]:
-        # TODO: ka10001 공식 컬럼에는 관리·투자경고·ETF·상장일이 없다.
-        # 그 플래그는 symbols_meta.csv 로 넘긴다.
+        # ka10001 공식 응답에는 관리·투자경고·ETF·상장일이 없다. 그 값은 ka10099 로 받는다.
         return self._post(STOCK_PATH, {"stk_cd": normalize_code(code)}, api_id=TR_STOCK_INFO, auth=True)
 
+    def symbol_list_page(
+        self,
+        mrkt_tp: str,
+        *,
+        cont_yn: str = "N",
+        next_key: str = "",
+    ) -> tuple[list[dict[str, Any]], str, str]:
+        """ka10099 한 페이지. 이어 받으려면 응답 헤더 cont-yn, next-key 를 그대로 넘긴다."""
+        payload, headers = self._exchange(
+            STOCK_PATH,
+            {"mrkt_tp": str(mrkt_tp)},
+            api_id=TR_SYMBOL_LIST,
+            auth=True,
+            cont_yn=cont_yn,
+            next_key=next_key,
+            timeout=30,
+        )
+        rows = payload.get("list")
+        if not isinstance(rows, list):
+            raise KiwoomError("종목정보 리스트 응답에 list가 없습니다.")
+        items = [row for row in rows if isinstance(row, dict)]
+        return items, headers.get("cont-yn", "N"), headers.get("next-key", "")
+
     def _post(self, path: str, body: dict, api_id: str, auth: bool) -> dict[str, Any]:
+        payload, _headers = self._exchange(path, body, api_id=api_id, auth=auth)
+        return payload
+
+    def _exchange(
+        self,
+        path: str,
+        body: dict,
+        api_id: str,
+        auth: bool,
+        cont_yn: str = "N",
+        next_key: str = "",
+        timeout: float = 10,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
         data = json.dumps(body).encode("utf-8")
         headers = {"Content-Type": "application/json;charset=UTF-8", "api-id": api_id}
         if auth:
             if not self.token:
                 raise KiwoomError("토큰이 없습니다.")
-            headers = request_headers(self.token, api_id)
+            headers = request_headers(self.token, api_id, cont_yn=cont_yn, next_key=next_key)
         request = urllib.request.Request(self.base_url + path, data=data, headers=headers, method="POST")
         try:
-            with self._opener(request, timeout=10) as response:
+            with self._opener(request, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
+                response_headers = _response_headers(response)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             raise KiwoomError(f"키움 호출 실패 ({exc.code}): {detail[:300]}") from exc
@@ -320,4 +365,6 @@ class KiwoomClient:
             raise KiwoomError(f"키움 서버에 연결하지 못했습니다: {exc.reason}") from exc
         if isinstance(payload, dict) and payload.get("return_code") not in (None, 0, "0"):
             raise KiwoomError(str(payload.get("return_msg") or payload.get("return_code")))
-        return payload
+        if not isinstance(payload, dict):
+            raise KiwoomError("키움 응답이 객체가 아닙니다.")
+        return payload, response_headers

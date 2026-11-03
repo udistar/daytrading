@@ -1,8 +1,9 @@
+import csv
 import json
 from datetime import datetime
 
 from daytrading.journal import Journal
-from daytrading.kiwoom import LIVE_REST, PAPER_REST, KiwoomClient, KiwoomError
+from daytrading.kiwoom import LIVE_REST, PAPER_REST, PAPER_WS, KiwoomClient, KiwoomError
 from daytrading.models import Intent, Snapshot, SymbolMeta
 from daytrading.paper import CheckResult, KiwoomBroker, check_connection, run_paper
 from daytrading.settings import default_settings
@@ -10,8 +11,9 @@ from daytrading.timeutil import KST
 
 
 class Response:
-    def __init__(self, payload: dict):
+    def __init__(self, payload: dict, headers: dict | None = None):
         self.payload = json.dumps(payload).encode("utf-8")
+        self.headers = headers or {}
 
     def read(self):
         return self.payload
@@ -186,3 +188,241 @@ def test_run_paper_subscribes_and_does_not_place_orders_on_dry_run(tmp_path):
     sent = " ".join(socket.sent)
     assert "REG" in sent
     assert "005930" in sent
+
+
+def _trade(code="005930"):
+    return {
+        "trnm": "REAL",
+        "data": [
+            {
+                "type": "0B",
+                "item": code,
+                "values": {"10": "+11000", "12": "10.00", "16": "10100", "14": "5000000000", "27": "+11010", "28": "+10990"},
+            }
+        ],
+    }
+
+
+def _notice(side_flag: str):
+    return {
+        "trnm": "REAL",
+        "data": [
+            {
+                "type": "00",
+                "item": "005930",
+                "values": {"9001": "005930", "910": "10000", "911": "1", "913": "체결", "907": side_flag},
+            }
+        ],
+    }
+
+
+def test_entry_block_is_written_once_per_minute_without_a_breakout(tmp_path):
+    opener = Opener()
+    socket = ScriptedSocket(
+        [
+            json.dumps({"trnm": "LOGIN", "return_code": 0}),
+            json.dumps(_trade()),
+            json.dumps(_trade()),
+        ]
+    )
+    moment = datetime(2026, 9, 25, 9, 6, tzinfo=KST)
+    journal = Journal(tmp_path)
+    run_paper(
+        default_settings(),
+        journal,
+        "key",
+        "secret",
+        dry_run=True,
+        opener=opener,
+        connect=lambda url: socket,
+        codes=["005930"],
+        clock=lambda: moment,
+    )
+    journal.close()
+    with (tmp_path / "rejections.csv").open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows == [
+        {
+            "ts": "2026-09-25 09:06:00",
+            "scenario": "paper",
+            "code": "005930",
+            "side": "buy",
+            "reason": "종목 정보 없음",
+            "detail": "",
+        }
+    ]
+    assert socket.messages == []
+
+
+def test_run_paper_fetches_symbol_meta_before_subscribe(tmp_path):
+    opener = _MetaOpener()
+    socket = ScriptedSocket(
+        [
+            json.dumps({"trnm": "LOGIN", "return_code": 0}),
+            json.dumps(_trade()),
+        ]
+    )
+    order = []
+
+    def connect(url):
+        order.append("ws")
+        assert url.startswith(PAPER_WS)
+        return socket
+
+    moment = datetime(2026, 9, 25, 9, 6, tzinfo=KST)
+    meta_path = tmp_path / "symbols_meta.csv"
+    journal = Journal(tmp_path / "logs")
+    engine = run_paper(
+        default_settings(),
+        journal,
+        "key",
+        "secret",
+        dry_run=True,
+        opener=opener,
+        connect=connect,
+        codes=["005930"],
+        meta_path=meta_path,
+        clock=lambda: moment,
+        sleeper=lambda _seconds: order.append("sleep"),
+    )
+    journal.close()
+    assert opener.apis[0] == "au10001"
+    assert opener.apis[1:] == ["ka10099"] * 6
+    assert order == ["sleep"] * 5 + ["ws"]
+    assert all(url.startswith(PAPER_REST) for url in opener.urls)
+    assert all(LIVE_REST not in url for url in opener.urls)
+    assert all("/api/dostk/ordr" not in url for url in opener.urls)
+    assert opener.apis.count("ka10099") == 6
+    book = engine.market.books["005930"]
+    assert book.meta.flags_known is True
+    assert book.meta.listed_on.isoformat() == "1975-06-11"
+    assert book.meta.is_etf is False
+    assert book.meta.is_admin is False
+    text = meta_path.read_text(encoding="utf-8-sig")
+    assert "unknown" in text
+    assert (tmp_path / "symbols_meta.csv.asof").read_text(encoding="utf-8").strip() == "2026-09-25"
+    with (tmp_path / "logs" / "rejections.csv").open(encoding="utf-8-sig", newline="") as handle:
+        reasons = {row["reason"] for row in csv.DictReader(handle)}
+    assert "종목 정보 없음" not in reasons
+    assert reasons
+
+
+def test_run_paper_leaves_at_hard_cutoff_when_flat(tmp_path):
+    socket = ScriptedSocket(
+        [
+            json.dumps({"trnm": "LOGIN", "return_code": 0}),
+            json.dumps(_trade()),
+            json.dumps(_trade()),
+            json.dumps(_trade()),
+        ]
+    )
+    moment = datetime(2026, 9, 25, 9, 50, tzinfo=KST)
+    journal = Journal(tmp_path)
+    engine = run_paper(
+        default_settings(),
+        journal,
+        "key",
+        "secret",
+        dry_run=True,
+        opener=Opener(),
+        connect=lambda url: socket,
+        codes=["005930"],
+        clock=lambda: moment,
+    )
+    journal.close()
+    assert len(socket.messages) == 2
+    assert socket.closed
+    assert engine.portfolio.positions == {}
+    assert engine.broker.place_calls == 0
+
+
+def test_run_paper_stays_until_the_position_is_flat_then_exits(tmp_path):
+    socket = ScriptedSocket(
+        [
+            json.dumps({"trnm": "LOGIN", "return_code": 0}),
+            json.dumps(_notice("매수")),
+            json.dumps(_notice("매도")),
+            json.dumps(_trade()),
+        ]
+    )
+    moment = datetime(2026, 9, 25, 9, 50, tzinfo=KST)
+    journal = Journal(tmp_path)
+    engine = run_paper(
+        default_settings(),
+        journal,
+        "key",
+        "secret",
+        dry_run=True,
+        opener=Opener(),
+        connect=lambda url: socket,
+        codes=["005930"],
+        clock=lambda: moment,
+    )
+    journal.close()
+    assert len(socket.messages) == 1
+    assert "005930" not in engine.portfolio.positions
+    assert socket.closed
+
+
+def test_run_paper_does_not_stop_before_hard_cutoff(tmp_path):
+    socket = ScriptedSocket(
+        [
+            json.dumps({"trnm": "LOGIN", "return_code": 0}),
+            json.dumps(_trade()),
+            json.dumps(_trade()),
+        ]
+    )
+    moment = datetime(2026, 9, 25, 9, 49, tzinfo=KST)
+    journal = Journal(tmp_path)
+    run_paper(
+        default_settings(),
+        journal,
+        "key",
+        "secret",
+        dry_run=True,
+        opener=Opener(),
+        connect=lambda url: socket,
+        codes=["005930"],
+        clock=lambda: moment,
+    )
+    journal.close()
+    assert socket.messages == []
+
+
+class _MetaOpener:
+    def __init__(self):
+        self.urls = []
+        self.apis = []
+
+    def __call__(self, request, timeout=10):
+        api = request.get_header("Api-id") or ""
+        self.urls.append(request.full_url)
+        self.apis.append(api)
+        if request.full_url.endswith("/oauth2/token"):
+            return Response({"return_code": 0, "token": "paper-token"})
+        body = json.loads(request.data.decode())
+        market = body.get("mrkt_tp")
+        if market == "0":
+            rows = [
+                {
+                    "code": "005930",
+                    "name": "삼성전자",
+                    "regDay": "19750611",
+                    "state": "증거금100%",
+                    "orderWarning": "0",
+                    "auditInfo": "정상",
+                }
+            ]
+        elif market == "8":
+            rows = [
+                {
+                    "code": "069500",
+                    "name": "KODEX 200",
+                    "regDay": "20021014",
+                    "state": "증거금100%",
+                    "orderWarning": "0",
+                }
+            ]
+        else:
+            rows = []
+        return Response({"return_code": 0, "list": rows}, {"cont-yn": "N", "next-key": ""})

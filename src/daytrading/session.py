@@ -180,6 +180,7 @@ def run_ticks(engine: Engine, ticks: list, controls: dict | None = None) -> dict
         grouped[stamp].append(tick)
     if not grouped:
         return engine.summary()
+    seen: dict = {}
     cursor = min(grouped)
     end = max(grouped)
     while cursor <= end:
@@ -215,7 +216,7 @@ def run_ticks(engine: Engine, ticks: list, controls: dict | None = None) -> dict
                 continue
             if book.dirty:
                 engine.journal.orderbook(snap)
-            intents, blocked = evaluate(snap, engine.portfolio, engine.settings)
+            intents, blocked = evaluate(snap, engine.portfolio, engine.settings, seen=seen)
             book.prev_price = book.last_price
             book.dirty = False
             for blocked_code, reason in blocked:

@@ -143,6 +143,24 @@ def test_breakout_rejection_is_recorded():
     assert rejected == [("005930", "매수/매도 잔량비 초과")]
 
 
+def test_entry_block_is_recorded_without_breakout_once_per_minute():
+    settings = default_settings()
+    book = portfolio()
+    seen: dict = {}
+    blocked = good_snap(prev_price=10_600)
+    intents, rejected = evaluate(blocked, book, settings, seen=seen)
+    assert intents == []
+    assert rejected == [("005930", "직전 고가 돌파 아님")]
+    _intents, again = evaluate(blocked, book, settings, seen=seen)
+    assert again == []
+    other = good_snap(code="000660", price=1_000)
+    _intents, other_row = evaluate(other, book, settings, seen=seen)
+    assert other_row == [("000660", "주가 범위 밖")]
+    later = good_snap(prev_price=10_600, ts=ts(9, 7))
+    _intents, next_minute = evaluate(later, book, settings, seen=seen)
+    assert next_minute == [("005930", "직전 고가 돌파 아님")]
+
+
 def test_add_blocks():
     settings = default_settings()
     held = position(last_buy_at=ts(9, 5, 0))
