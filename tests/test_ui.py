@@ -100,6 +100,8 @@ ALTERNATES = {
     "live_query_per_sec": 3.0,
     "ws_max_symbols": 40,
     "ranking_poll_seconds": 12,
+    "paper_unfilled_cancel_seconds": 8,
+    "paper_fill_poll_seconds": 5,
     "condition_max": 4,
     "condition_seqs": "0,1",
     "commission_rate_pct": 0.02,

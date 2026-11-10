@@ -19,7 +19,12 @@ from daytrading.kiwoom import (
     KiwoomError,
     condition_realtime_packet,
     extract_codes,
+    order_fill_reg_packet,
+    order_key,
+    parse_balance_map,
+    parse_order_detail_rows,
     parse_real_messages,
+    plan_order_sync,
     ws_login_packet,
     ws_reg_packet,
 )
@@ -50,6 +55,12 @@ class KiwoomBroker:
         self.dry_run = dry_run
         self.place_calls = 0
         self.triggers: dict[tuple[str, str], int] = {}
+        self.working: dict[str, dict] = {}
+        self.applied: set[str] = set()
+        self.unfilled_done: list[dict] = []
+        self.baseline: dict[str, int] = {}
+        self.baseline_ready = False
+        self._last_poll: datetime | None = None
         if LIVE_REST == client.base_url:
             raise KiwoomError("실전 주소로는 주문할 수 없습니다.")
 
@@ -72,15 +83,88 @@ class KiwoomBroker:
         if self.dry_run:
             return record, None
         self.place_calls += 1
-        payload = self.client.place(
-            intent.side,
-            intent.code,
-            intent.qty,
-            intent.limit_price,
-            market=intent.order_type == "market",
-        )
+        try:
+            payload = self.client.place(
+                intent.side,
+                intent.code,
+                intent.qty,
+                intent.limit_price,
+                market=intent.order_type == "market",
+            )
+        except KiwoomError as exc:
+            record.status = "rejected"
+            record.note = str(exc)
+            return record, None
         record.broker_order_no = str(payload.get("ord_no") or "")
+        if intent.order_type != "market":
+            record.note = (record.note + " / " if record.note else "") + "모의 보통 지정가"
+        if record.broker_order_no:
+            self.applied.add(order_key(record.broker_order_no))
+            self.working[order_key(record.broker_order_no)] = {
+                "ord_no": record.broker_order_no,
+                "code": intent.code,
+                "name": intent.name,
+                "side": intent.side,
+                "qty": intent.qty,
+                "filled": 0,
+                "limit_price": intent.limit_price,
+                "placed_at": snap.ts,
+                "order_type": intent.order_type,
+                "reason": intent.reason,
+                "cancel_sent": False,
+            }
         return record, None
+
+    def take_fill_qty(self, order_no: str, qty: int) -> int:
+        """실시간 체결량. 이미 조회에 반영된 수량은 다시 넣지 않는다."""
+        key = order_key(order_no)
+        item = self.working.get(key)
+        if item is None:
+            return 0 if key in self.applied else qty
+        room = int(item["qty"]) - int(item["filled"])
+        delta = max(0, min(int(qty), room))
+        item["filled"] = int(item["filled"]) + delta
+        if item["filled"] >= item["qty"]:
+            item["done"] = True
+        return delta
+
+    def capture_baseline(self) -> None:
+        try:
+            balances = parse_balance_map(self.client.balance())
+        except KiwoomError:
+            self.baseline_ready = False
+            return
+        self.baseline = {code: int(slot["qty"]) for code, slot in balances.items()}
+        self.baseline_ready = True
+
+    def poll_working(self, now: datetime, settings: Settings) -> tuple[list[dict], list[str]]:
+        if not self.working:
+            return [], []
+        if self._last_poll is not None and (now - self._last_poll).total_seconds() < float(settings.paper_fill_poll_seconds):
+            return [], []
+        self._last_poll = now
+        rows = parse_order_detail_rows(self.client.order_detail(""))
+        balances = parse_balance_map(self.client.balance())
+        fills, cancels = plan_order_sync(
+            self.working,
+            rows,
+            balances,
+            self.baseline,
+            now,
+            float(settings.paper_unfilled_cancel_seconds),
+            use_balance=self.baseline_ready,
+        )
+        for key, item in list(self.working.items()):
+            if item.get("done"):
+                if int(item["filled"]) < int(item["qty"]):
+                    self.unfilled_done.append(item)
+                self.working.pop(key, None)
+        return fills, cancels
+
+    def forget_cancel(self, order_no: str) -> None:
+        item = self.working.get(order_key(order_no))
+        if item is not None:
+            item["cancel_sent"] = False
 
 
 def connect_websocket(url: str, timeout: float = 10):
@@ -260,15 +344,21 @@ def _apply_vi(engine: Engine, event: dict[str, Any], now: datetime) -> None:
 def _apply_notice(engine: Engine, event: dict[str, Any], now: datetime) -> None:
     status = str(event.get("status") or "")
     if status and "체결" not in status and status not in {"0", "00"}:
-        # TODO: 00 체결통보의 913 상태코드 표는 예제에 값 설명이 없다. 체결이 아닌 값은 잔고에 넣지 않는다.
+        # 00의 913은 접수, 체결, 확인, 취소, 거부. 체결이 아닌 값은 잔고에 넣지 않는다.
         return
     code = event["code"]
     qty = int(event.get("fill_qty") or 0)
     price = int(event.get("fill_price") or 0)
     if qty <= 0 or price <= 0:
         return
-    side = "sell" if str(event.get("side_flag")) in {"1", "2", "매도"} else "buy"
-    # 907 매도수구분의 숫자는 예제에 표가 없다. 대기 중인 쪽과 맞으면 그 방향을 쓴다.
+    # 907 매도수구분 공식 설명: 1 매도, 2 매수.
+    side = "sell" if str(event.get("side_flag")) in {"1", "매도"} else "buy"
+    broker = engine.broker
+    take = getattr(broker, "take_fill_qty", None)
+    if take is not None:
+        qty = take(str(event.get("order_no") or ""), qty)
+        if qty <= 0:
+            return
     if code in engine.portfolio.pending_sells and code not in engine.portfolio.pending_buys:
         side = "sell"
     elif code in engine.portfolio.pending_buys and code not in engine.portfolio.pending_sells:
@@ -329,6 +419,8 @@ def run_paper(
     if meta_path is not None:
         refresh_symbol_meta(client, meta_path, now_fn().date(), sleeper=sleeper)
     broker = KiwoomBroker(client, dry_run=dry_run)
+    if not dry_run:
+        broker.capture_baseline()
     engine = Engine(settings, journal, "paper", broker=broker)
     pinned = codes is not None
     watched = _select_codes(client, settings, codes)
@@ -339,7 +431,8 @@ def run_paper(
         sock.send(json.dumps(ws_login_packet(client.token)))
         _read(sock, lambda message: str(message.get("trnm", "")).upper() == "LOGIN")
         if watched:
-            sock.send(json.dumps(ws_reg_packet(watched, ["0B", "0D", "1h", "00"])))
+            sock.send(json.dumps(ws_reg_packet(watched, ["0B", "0D", "1h"])))
+        sock.send(json.dumps(order_fill_reg_packet()))
         _send_conditions(sock, settings)
         last_rank_at = now_fn()
         seen: dict = {}
@@ -356,20 +449,24 @@ def run_paper(
                 break
             message = _message(raw)
             now = now_fn()
-            if not pinned and (now - last_rank_at).total_seconds() >= float(settings.ranking_poll_seconds):
-                watched = _select_codes(client, settings, None)
-                _watch(engine, watched, meta_path)
-                if watched:
-                    sock.send(json.dumps(ws_reg_packet(watched, ["0B", "0D", "1h", "00"])))
-                last_rank_at = now
-            if controls:
-                engine.portfolio.paused = bool(controls.get("paused"))
-                if controls.get("emergency"):
-                    engine.portfolio.emergency = True
-            for reply in apply_realtime(engine, message, now):
-                sock.send(reply)
-            _evaluate_dirty(engine, now, seen)
-            engine.drain(now)
+            try:
+                if not pinned and (now - last_rank_at).total_seconds() >= float(settings.ranking_poll_seconds):
+                    watched = _select_codes(client, settings, None)
+                    _watch(engine, watched, meta_path)
+                    if watched:
+                        sock.send(json.dumps(ws_reg_packet(watched, ["0B", "0D", "1h"])))
+                    last_rank_at = now
+                if controls:
+                    engine.portfolio.paused = bool(controls.get("paused"))
+                    if controls.get("emergency"):
+                        engine.portfolio.emergency = True
+                for reply in apply_realtime(engine, message, now):
+                    sock.send(reply)
+                _evaluate_dirty(engine, now, seen)
+                engine.drain(now)
+                _settle_working(engine, now)
+            except KiwoomError as exc:
+                engine.reject(now, "", "buy", "주문 거절", str(exc))
             if now.time() >= settings.clock("hard_cutoff") and not _open_positions(engine):
                 break
     finally:
@@ -377,6 +474,88 @@ def run_paper(
         if close:
             close()
     return engine
+
+
+def _settle_working(engine: Engine, now: datetime) -> None:
+    broker = engine.broker
+    poll = getattr(broker, "poll_working", None)
+    if poll is None:
+        return
+    try:
+        fills, cancels = poll(now, engine.settings)
+    except KiwoomError as exc:
+        engine.reject(now, "", "buy", "체결 조회 실패", str(exc))
+        return
+    for item in getattr(broker, "unfilled_done", []):
+        _release_working(engine, item)
+    if hasattr(broker, "unfilled_done"):
+        broker.unfilled_done.clear()
+    for spec in fills:
+        _book_synced_fill(engine, spec, now)
+    for order_no in cancels:
+        _cancel_working(engine, order_no, now)
+
+
+def _book_synced_fill(engine: Engine, spec: dict, now: datetime) -> None:
+    code = spec["code"]
+    side = spec["side"]
+    qty = int(spec["qty"])
+    price = int(spec["price"])
+    trigger = price
+    remembered = getattr(engine.broker, "triggers", {}).get((code, side))
+    if remembered:
+        trigger = int(remembered)
+    notional = price * qty
+    fee = int(round(notional * engine.settings.commission_rate_pct / 100))
+    tax = int(round(notional * engine.settings.sell_tax_rate_pct / 100)) if side == "sell" else 0
+    slip = (trigger - price) * qty if side == "sell" else (price - trigger) * qty
+    fill = Fill(
+        order_id=str(spec.get("ord_no") or "Q"),
+        ts=now,
+        code=code,
+        name=str(spec.get("name") or code),
+        side=side,
+        reason=str(spec.get("reason") or "exchange"),
+        qty=qty,
+        price=price,
+        fee_krw=fee,
+        tax_krw=tax,
+        trigger_price=trigger,
+        slippage_krw=slip,
+    )
+    apply_fill(engine.portfolio, fill, engine.settings)
+    engine.journal.fill(fill)
+    engine.prices[code] = price
+    engine.fill_count += 1
+    engine.reasons[fill.reason] += 1
+
+
+def _release_working(engine: Engine, item: dict) -> None:
+    code = item["code"]
+    left = int(item["qty"]) - int(item["filled"])
+    if item["side"] == "buy":
+        engine.portfolio.pending_buys.discard(code)
+        engine.portfolio.pending_buy_amount.pop(code, None)
+    elif left > 0:
+        engine.portfolio.free_sell(code, left)
+
+
+def _cancel_working(engine: Engine, order_no: str, now: datetime) -> None:
+    broker = engine.broker
+    item = broker.working.get(order_key(order_no)) if hasattr(broker, "working") else None
+    code = item["code"] if item else ""
+    try:
+        if item is not None:
+            broker.client.cancel(code, order_no, 0)
+    except KiwoomError as exc:
+        if hasattr(broker, "forget_cancel"):
+            broker.forget_cancel(order_no)
+        engine.reject(now, code, item["side"] if item else "buy", "취소 거절", str(exc))
+        return
+    if item is not None:
+        _release_working(engine, item)
+        broker.working.pop(order_key(order_no), None)
+    engine.reject(now, code, item["side"] if item else "buy", "미체결 취소", order_no)
 
 
 def _open_positions(engine: Engine) -> bool:

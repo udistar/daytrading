@@ -5,11 +5,16 @@ import pytest
 from daytrading.kiwoom import (
     LIVE_REST,
     LIMIT_IOC,
+    LIMIT_REGULAR,
     MARKET,
     PAPER_REST,
     PAPER_WS,
     KiwoomClient,
     LiveTradingLocked,
+    order_fill_reg_packet,
+    parse_balance_map,
+    parse_order_detail_rows,
+    plan_order_sync,
     condition_realtime_packet,
     condition_stop_packet,
     normalize_code,
@@ -171,6 +176,149 @@ def test_token_and_rank_queries_are_not_blocked_by_the_order_host_gate():
     client, opener = _order_client(LIVE_REST)
     assert client.issue_token() == "tok"
     assert opener.requests[0].full_url == LIVE_REST + "/oauth2/token"
+
+
+def test_mock_limit_order_is_regular_not_ioc():
+    client, opener = _order_client(PAPER_REST)
+    client.place("buy", "036540", 1, 197500, False)
+    body = json.loads(opener.requests[0].data.decode("utf-8"))
+    assert body["trde_tp"] == LIMIT_REGULAR == "0"
+    assert body["trde_tp"] != LIMIT_IOC
+    client.place("sell", "036540", 1, 0, True)
+    market = json.loads(opener.requests[1].data.decode("utf-8"))
+    assert market["trde_tp"] == MARKET == "3"
+
+
+def test_order_detail_and_balance_parse_official_rows():
+    rows = parse_order_detail_rows(
+        {
+            "acnt_ord_cntr_prps_dtl": [
+                {
+                    "ord_no": "0166849",
+                    "stk_cd": "A005930",
+                    "stk_nm": "삼성전자",
+                    "io_tp_nm": "현금매수",
+                    "cntr_qty": "0000000001",
+                    "cntr_uv": "0000197400",
+                    "ord_remnq": "0000000000",
+                }
+            ]
+        }
+    )
+    assert rows[0]["code"] == "005930"
+    assert rows[0]["side"] == "buy"
+    assert rows[0]["cntr_qty"] == 1
+    assert rows[0]["cntr_price"] == 197400
+    held = parse_balance_map(
+        {"acnt_evlt_remn_indv_tot": [{"stk_cd": "A005930", "rmnd_qty": "000000000000001", "cur_prc": "000000197400"}]}
+    )
+    assert held["005930"]["qty"] == 1
+    assert held["005930"]["price"] == 197400
+
+
+def test_sync_uses_kt00007_fill_and_cancels_a_resting_limit():
+    from datetime import datetime, timedelta
+
+    from daytrading.timeutil import KST
+
+    placed = datetime(2026, 11, 10, 14, 0, tzinfo=KST)
+    working = {
+        "166849": {
+            "ord_no": "0166849",
+            "code": "005930",
+            "name": "삼성전자",
+            "side": "buy",
+            "qty": 1,
+            "filled": 0,
+            "limit_price": 197500,
+            "placed_at": placed,
+            "order_type": "limit_ioc",
+            "reason": "entry",
+            "cancel_sent": False,
+        }
+    }
+    fills, cancels = plan_order_sync(
+        working,
+        [{"ord_no": "0166849", "code": "005930", "side": "buy", "cntr_qty": 1, "cntr_price": 197400, "rem_qty": 0}],
+        {},
+        {},
+        placed + timedelta(seconds=1),
+        3,
+        use_balance=True,
+    )
+    assert fills[0]["price"] == 197400
+    assert fills[0]["qty"] == 1
+    assert cancels == []
+
+    resting = {
+        "1": {
+            "ord_no": "0000001",
+            "code": "036540",
+            "name": "SFA",
+            "side": "buy",
+            "qty": 1,
+            "filled": 0,
+            "limit_price": 5000,
+            "placed_at": placed,
+            "order_type": "limit_ioc",
+            "reason": "entry",
+            "cancel_sent": False,
+        }
+    }
+    fills, cancels = plan_order_sync(
+        resting,
+        [{"ord_no": "0000001", "code": "036540", "side": "buy", "cntr_qty": 0, "cntr_price": 0, "rem_qty": 1}],
+        {},
+        {},
+        placed + timedelta(seconds=3),
+        3,
+        use_balance=False,
+    )
+    assert fills == []
+    assert cancels == ["0000001"]
+
+
+def test_balance_increase_fills_when_the_order_query_has_no_row():
+    from datetime import datetime, timedelta
+
+    from daytrading.timeutil import KST
+
+    placed = datetime(2026, 11, 10, 13, 43, tzinfo=KST)
+    working = {
+        "166849": {
+            "ord_no": "0166849",
+            "code": "005930",
+            "name": "삼성전자",
+            "side": "buy",
+            "qty": 1,
+            "filled": 0,
+            "limit_price": 197500,
+            "placed_at": placed,
+            "order_type": "market",
+            "reason": "entry",
+            "cancel_sent": False,
+        }
+    }
+    fills, cancels = plan_order_sync(
+        working,
+        [],
+        {"005930": {"qty": 1, "price": 197400}},
+        {"005930": 0},
+        placed + timedelta(seconds=2),
+        3,
+        use_balance=True,
+    )
+    assert fills[0]["qty"] == 1
+    assert fills[0]["price"] == 197400
+    assert cancels == []
+
+
+def test_order_fill_registration_is_its_own_packet():
+    packet = order_fill_reg_packet()
+    assert packet["trnm"] == "REG"
+    assert packet["grp_no"] == "2"
+    assert packet["data"][0]["type"] == ["00"]
+    assert packet["data"][0]["item"] == [""]
 
 
 def test_check_live_block_command_rejects_without_network_or_secrets(tmp_path, monkeypatch, capsys):

@@ -198,7 +198,7 @@ def maybe_entry(snap: Snapshot, settings: Settings, portfolio: Portfolio) -> Int
         order_type="limit_ioc",
         limit_price=limit_price,
         amount_krw=limit_price * qty,
-        note="매도1호가+틱 지정가 IOC",
+        note="매도1호가+틱 지정가",
         trigger_price=limit_price,
     )
 

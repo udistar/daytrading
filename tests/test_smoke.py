@@ -128,6 +128,31 @@ def test_smoke_buys_one_share_on_mock_and_sells_the_fill_while_the_session_is_op
     assert report["sell_order_no"] == "00025"
 
 
+def test_smoke_sells_when_the_fill_query_confirms_and_realtime_is_silent():
+    from daytrading.smoke import run_smoke_roundtrip
+
+    client = FakeClient()
+    answers = [
+        {"order_no": "0166849", "qty": 1, "price": 197400, "side": "buy"},
+        {"order_no": "0166850", "qty": 1, "price": 197300, "side": "sell"},
+    ]
+
+    def query(_order_no):
+        return answers.pop(0)
+
+    report = run_smoke_roundtrip(
+        client,
+        market_open=True,
+        wait_fill=lambda *_args: None,
+        query_fill=query,
+    )
+    assert client.placed[0]["side"] == "buy"
+    assert client.placed[1]["side"] == "sell"
+    assert client.placed[1]["qty"] == 1
+    assert report["buy_fill_price"] == 197400
+    assert report["sell_fill_price"] == 197300
+
+
 def test_smoke_does_not_sell_when_the_session_is_closed_or_the_buy_did_not_fill():
     from daytrading.smoke import run_smoke_roundtrip
 

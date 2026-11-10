@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -37,9 +38,13 @@ TR_CONDITION_LIST = "ka10171"
 TR_CONDITION_REAL = "ka10173"
 TR_CONDITION_STOP = "ka10174"
 
-# 지정가 IOC / 시장가. 공식 예제의 trde_tp 설명.
+# 지정가 IOC / 보통 지정가 / 시장가. 공식 예제 trde_tp: 0 보통, 3 시장가, 10 보통(IOC).
 LIMIT_IOC = "10"
+LIMIT_REGULAR = "0"
 MARKET = "3"
+ACNT_PATH = "/api/dostk/acnt"
+TR_ORDER_DETAIL = "kt00007"
+TR_BALANCE = "kt00018"
 
 
 class LiveTradingLocked(RuntimeError):
@@ -114,14 +119,179 @@ def order_body(
     limit_price: int,
     market: bool,
     exchange: str = "KRX",
+    regular_limit: bool = False,
 ) -> dict[str, str]:
+    if market:
+        trade_type = MARKET
+    elif regular_limit:
+        trade_type = LIMIT_REGULAR
+    else:
+        trade_type = LIMIT_IOC
     return {
         "dmst_stex_tp": exchange,
         "stk_cd": normalize_code(code),
         "ord_qty": str(int(qty)),
-        "trde_tp": MARKET if market else LIMIT_IOC,
+        "trde_tp": trade_type,
         "ord_uv": "" if market else str(int(limit_price)),
         "cond_uv": "",
+    }
+
+
+def order_detail_body(stk_cd: str = "") -> dict[str, str]:
+    """kt00007 공식 예제와 같은 값. stk_cd 빈 문자열은 전체 종목이다."""
+    return {
+        "ord_dt": "",
+        "qry_tp": "1",
+        "stk_bond_tp": "0",
+        "sell_tp": "0",
+        "stk_cd": normalize_code(stk_cd) if str(stk_cd).strip() else "",
+        "fr_ord_no": "",
+        "dmst_stex_tp": "%",
+    }
+
+
+def balance_body() -> dict[str, str]:
+    """kt00018 공식 예제. qry_tp 1은 합산이다."""
+    return {"qry_tp": "1", "dmst_stex_tp": "KRX"}
+
+
+def order_fill_reg_packet(grp_no: str = "2") -> dict[str, Any]:
+    """주문체결(00)을 시세 그룹과 따로 등록한다. 공식 예제의 type은 00, item은 빈 값이다."""
+    return {
+        "trnm": "REG",
+        "grp_no": grp_no,
+        "refresh": "1",
+        "data": [{"item": [""], "type": ["00"]}],
+    }
+
+
+def order_key(value: object) -> str:
+    text = str(value or "").strip()
+    return text.lstrip("0") or "0"
+
+
+def padded_int(value: object) -> int:
+    text = str(value or "").strip().replace(",", "")
+    if not text or text in {"+", "-"}:
+        return 0
+    try:
+        return int(text)
+    except ValueError:
+        return 0
+
+
+def _order_side(name: object) -> str:
+    text = str(name or "")
+    if "매도" in text:
+        return "sell"
+    if "매수" in text:
+        return "buy"
+    return ""
+
+
+def parse_order_detail_rows(payload: object) -> list[dict[str, Any]]:
+    """kt00007 acnt_ord_cntr_prps_dtl. 체결수량·체결단가는 왼쪽 0이 채워진 정수다."""
+    rows = payload.get("acnt_ord_cntr_prps_dtl") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return []
+    parsed = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        parsed.append(
+            {
+                "ord_no": str(row.get("ord_no") or "").strip(),
+                "code": normalize_code(str(row.get("stk_cd") or "")),
+                "name": str(row.get("stk_nm") or ""),
+                "side": _order_side(row.get("io_tp_nm")),
+                "cntr_qty": padded_int(row.get("cntr_qty")),
+                "cntr_price": padded_int(row.get("cntr_uv")),
+                "rem_qty": padded_int(row.get("ord_remnq")),
+            }
+        )
+    return parsed
+
+
+def parse_balance_map(payload: object) -> dict[str, dict[str, int]]:
+    """kt00018 보유수량·현재가. 같은 종목이 여러 줄이면 수량을 더한다."""
+    rows = payload.get("acnt_evlt_remn_indv_tot") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return {}
+    found: dict[str, dict[str, int]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        code = normalize_code(str(row.get("stk_cd") or ""))
+        if not code:
+            continue
+        slot = found.setdefault(code, {"qty": 0, "price": 0})
+        slot["qty"] += padded_int(row.get("rmnd_qty"))
+        price = padded_int(row.get("cur_prc"))
+        if price > 0:
+            slot["price"] = price
+    return found
+
+
+def plan_order_sync(
+    working: dict[str, dict[str, Any]],
+    order_rows: list[dict[str, Any]],
+    balances: dict[str, dict[str, int]],
+    baselines: dict[str, int],
+    now: datetime,
+    cancel_seconds: float,
+    *,
+    use_balance: bool,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """우리 주문번호의 새 체결과, 시간이 지난 미체결 지정가의 주문번호를 고른다."""
+    by_key = {order_key(row.get("ord_no")): row for row in order_rows}
+    fills: list[dict[str, Any]] = []
+    cancels: list[str] = []
+    for key, item in list(working.items()):
+        row = by_key.get(key)
+        filled = int(item.get("filled") or 0)
+        qty = int(item["qty"])
+        if row and row["cntr_qty"] > filled and row["cntr_price"] > 0:
+            delta = min(qty - filled, row["cntr_qty"] - filled)
+            if delta > 0:
+                fills.append(_sync_fill(item, delta, int(row["cntr_price"]), row.get("side") or item["side"]))
+                filled += delta
+                item["filled"] = filled
+        elif use_balance and row is None and filled < qty and item["side"] == "buy":
+            held = int(balances.get(item["code"], {}).get("qty") or 0)
+            grew = held - int(baselines.get(item["code"], 0))
+            gap = grew - _buy_filled(working, item["code"])
+            price = int(balances.get(item["code"], {}).get("price") or 0) or int(item.get("limit_price") or 0)
+            take = min(qty - filled, gap)
+            if take > 0 and price > 0:
+                fills.append(_sync_fill(item, take, price, "buy"))
+                filled += take
+                item["filled"] = filled
+        done = filled >= qty or (row is not None and row["rem_qty"] == 0 and row["cntr_qty"] <= filled)
+        if done:
+            item["done"] = True
+            continue
+        age = (now - item["placed_at"]).total_seconds()
+        resting = item.get("order_type") != "market"
+        still_open = row is None or row["rem_qty"] > 0
+        if resting and still_open and age >= cancel_seconds and not item.get("cancel_sent"):
+            item["cancel_sent"] = True
+            cancels.append(str(item["ord_no"]))
+    return fills, cancels
+
+
+def _buy_filled(working: dict[str, dict[str, Any]], code: str) -> int:
+    return sum(int(item.get("filled") or 0) for item in working.values() if item.get("code") == code and item.get("side") == "buy")
+
+
+def _sync_fill(item: dict[str, Any], qty: int, price: int, side: str) -> dict[str, Any]:
+    return {
+        "ord_no": str(item["ord_no"]),
+        "code": item["code"],
+        "name": item.get("name") or item["code"],
+        "side": side,
+        "qty": qty,
+        "price": price,
+        "reason": item.get("reason") or "exchange",
     }
 
 
@@ -332,8 +502,24 @@ class KiwoomClient:
 
     def place(self, intent_side: str, code: str, qty: int, limit_price: int, market: bool) -> dict[str, Any]:
         api_id = TR_BUY if intent_side == "buy" else TR_SELL
-        body = order_body(code=code, qty=qty, limit_price=limit_price, market=market)
+        # 모의투자 서버는 IOC/FOK(trde_tp 10 등)를 RC4001로 거절한다. 그 호스트의 지정가는 보통(0)이다.
+        paper = urlsplit(str(self.base_url or "")).netloc == "mockapi.kiwoom.com"
+        body = order_body(
+            code=code,
+            qty=qty,
+            limit_price=limit_price,
+            market=market,
+            regular_limit=paper and not market,
+        )
         return self._post(ORDER_PATH, body, api_id=api_id, auth=True)
+
+    def order_detail(self, stk_cd: str = "") -> dict[str, Any]:
+        """kt00007 계좌별주문체결내역상세. 조회라 주문 호스트 잠금은 타지 않는다."""
+        return self._post(ACNT_PATH, order_detail_body(stk_cd), api_id=TR_ORDER_DETAIL, auth=True)
+
+    def balance(self) -> dict[str, Any]:
+        """kt00018 계좌평가잔고. 조회라 주문 호스트 잠금은 타지 않는다."""
+        return self._post(ACNT_PATH, balance_body(), api_id=TR_BALANCE, auth=True)
 
     def modify(self, code: str, orig_ord_no: str, qty: int, limit_price: int, exchange: str = "KRX") -> dict[str, Any]:
         """kt10002 공식 예제와 같은 필드. 호스트 검사는 전송 직전에 한다."""
@@ -426,7 +612,12 @@ class KiwoomClient:
         except urllib.error.URLError as exc:
             raise KiwoomError(f"키움 서버에 연결하지 못했습니다: {exc.reason}") from exc
         if isinstance(payload, dict) and payload.get("return_code") not in (None, 0, "0"):
-            raise KiwoomError(str(payload.get("return_msg") or payload.get("return_code")))
+            code = payload.get("return_code")
+            message = str(payload.get("return_msg") or "")
+            text = message or str(code)
+            if code not in (None, "") and str(code) not in text:
+                text = f"[{code}] {message}".strip()
+            raise KiwoomError(text)
         if not isinstance(payload, dict):
             raise KiwoomError("키움 응답이 객체가 아닙니다.")
         return payload, response_headers

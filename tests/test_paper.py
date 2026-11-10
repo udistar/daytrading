@@ -122,6 +122,124 @@ def test_check_connection_never_calls_the_order_api():
     assert any(PAPER_REST in url for url in opener.urls)
 
 
+def test_rejected_order_is_recorded_and_the_next_order_still_runs(tmp_path):
+    from daytrading.models import Intent, OrderRecord
+    from daytrading.session import Engine
+
+    class Broker:
+        def __init__(self):
+            self.codes = []
+
+        def submit(self, order_id, intent, snap, settings):
+            self.codes.append(intent.code)
+            if intent.code == "036540":
+                return (
+                    OrderRecord(
+                        order_id,
+                        snap.ts,
+                        intent.code,
+                        intent.name,
+                        intent.side,
+                        intent.reason,
+                        intent.qty,
+                        intent.order_type,
+                        intent.limit_price,
+                        "rejected",
+                        "[2000](RC4001:모의투자 IOC/FOK 주문은 불가합니다.)",
+                    ),
+                    None,
+                )
+            return (
+                OrderRecord(
+                    order_id,
+                    snap.ts,
+                    intent.code,
+                    intent.name,
+                    intent.side,
+                    intent.reason,
+                    intent.qty,
+                    intent.order_type,
+                    intent.limit_price,
+                    "accepted",
+                    "",
+                ),
+                None,
+            )
+
+    from datetime import date
+
+    from daytrading.models import SymbolMeta
+
+    journal = Journal(tmp_path)
+    engine = Engine(default_settings(), journal, "paper", broker=Broker())
+    moment = datetime(2026, 11, 10, 9, 6, 17, tzinfo=KST)
+    for code in ("036540", "005930"):
+        engine.market.update(
+            SymbolMeta(code, code, 1000, 1000, 1300, date(2020, 1, 2), flags_known=True),
+            ts=moment,
+            price=1000,
+            acc_value=1,
+            strength=100,
+            best_bid=990,
+            best_ask=1010,
+            bid_qty=1,
+            ask_qty=1,
+            vi_active=False,
+            vi_price=0,
+        )
+        engine.enqueue(Intent(code, code, "buy", "entry", 1, "limit_ioc", 1000, 1000, "지정가"))
+    engine.drain(moment)
+    engine.drain(moment.replace(second=19))
+    journal.close()
+    assert engine.broker.codes == ["036540", "005930"]
+    with (tmp_path / "rejections.csv").open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["code"] == "036540"
+    assert rows[0]["reason"] == "주문 거절"
+    assert "RC4001" in rows[0]["detail"]
+    assert "036540" not in engine.portfolio.pending_buys
+
+
+def test_paper_loop_continues_after_an_order_error(tmp_path, monkeypatch):
+    from daytrading.session import Engine
+
+    calls = {"n": 0}
+    real = Engine.drain
+
+    def drain(self, now):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KiwoomError("[2000](RC4001:모의투자 IOC/FOK 주문은 불가합니다.)")
+        return real(self, now)
+
+    monkeypatch.setattr(Engine, "drain", drain)
+    socket = ScriptedSocket(
+        [
+            json.dumps({"trnm": "LOGIN", "return_code": 0}),
+            json.dumps(_trade()),
+            json.dumps(_trade("000660")),
+        ]
+    )
+    journal = Journal(tmp_path)
+    run_paper(
+        default_settings(),
+        journal,
+        "key",
+        "secret",
+        dry_run=True,
+        opener=Opener(),
+        connect=lambda url: socket,
+        codes=["005930"],
+        clock=lambda: datetime(2026, 11, 10, 9, 10, tzinfo=KST),
+    )
+    journal.close()
+    assert calls["n"] == 2
+    text = (tmp_path / "rejections.csv").read_text(encoding="utf-8-sig")
+    assert "RC4001" in text
+    sent = " ".join(socket.sent)
+    assert '"00"' in sent
+
+
 def test_paper_order_posts_only_to_the_mock_host():
     opener = Opener()
     client = KiwoomClient("key", "secret", mode="paper", opener=opener)

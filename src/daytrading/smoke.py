@@ -13,7 +13,7 @@ from datetime import datetime, time as clock_time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from daytrading.kiwoom import LiveTradingLocked
+from daytrading.kiwoom import LiveTradingLocked, order_fill_reg_packet, parse_order_detail_rows, order_key
 from daytrading.timeutil import KST
 
 SMOKE_CODE = "005930"
@@ -78,16 +78,7 @@ class FillListener:
         self.sock = opener(self.client.ws_url, timeout=10)
         self.sock.settimeout(2)
         self.sock.send(json.dumps(ws_login_packet(self.client.token)))
-        self.sock.send(
-            json.dumps(
-                {
-                    "trnm": "REG",
-                    "grp_no": "1",
-                    "refresh": "1",
-                    "data": [{"item": [], "type": ["00"]}],
-                }
-            )
-        )
+        self.sock.send(json.dumps(order_fill_reg_packet()))
 
     def wait(self, _client, order_no: str, timeout: float) -> dict | None:
         from daytrading.kiwoom import parse_real_messages
@@ -123,6 +114,21 @@ class FillListener:
         self.sock = None
 
 
+def fill_from_order_detail(payload: dict, order_no: str) -> dict | None:
+    """kt00007 응답에서 그 주문번호의 체결수량·체결단가를 찾는다."""
+    for row in parse_order_detail_rows(payload):
+        if order_key(row["ord_no"]) != order_key(order_no):
+            continue
+        if row["cntr_qty"] > 0 and row["cntr_price"] > 0:
+            return {
+                "order_no": order_no,
+                "qty": row["cntr_qty"],
+                "price": row["cntr_price"],
+                "side": row["side"] or "buy",
+            }
+    return None
+
+
 def run_smoke_roundtrip(
     client,
     *,
@@ -130,6 +136,7 @@ def run_smoke_roundtrip(
     wait_fill,
     code: str = SMOKE_CODE,
     timeout: float = 20,
+    query_fill=None,
 ) -> dict:
     """1주 시장가 매수 후, 장중 체결이 있으면 그 수량만 시장가로 판다."""
     assert_paper_endpoint(client.base_url)
@@ -148,6 +155,8 @@ def run_smoke_roundtrip(
     report["buy_order_no"] = order_no
     print(f"매수 주문번호 {order_no}")
     fill = wait_fill(client, order_no, timeout) if order_no else None
+    if (not fill or int(fill.get("qty") or 0) < 1) and query_fill and order_no:
+        fill = query_fill(order_no)
     qty = int(fill.get("qty") or 0) if fill else 0
     if qty > 0:
         report["buy_fill_qty"] = qty
@@ -166,6 +175,8 @@ def run_smoke_roundtrip(
     print(f"매도 주문번호 {sell_no}")
     if sell_no:
         sold = wait_fill(client, sell_no, timeout)
+        if (not sold or int(sold.get("qty") or 0) < 1) and query_fill:
+            sold = query_fill(sell_no)
         sold_qty = int(sold.get("qty") or 0) if sold else 0
         if sold_qty > 0:
             report["sell_fill_price"] = int(sold.get("price") or 0)
@@ -196,7 +207,16 @@ def run_smoke(home: Path) -> int:
         listener = FillListener(client)
         listener.start()
         try:
-            run_smoke_roundtrip(client, market_open=open_now, wait_fill=listener.wait)
+            def query_fill(order_no: str):
+                return fill_from_order_detail(client.order_detail(SMOKE_CODE), order_no)
+
+            run_smoke_roundtrip(
+                client,
+                market_open=open_now,
+                wait_fill=listener.wait,
+                query_fill=query_fill,
+                timeout=5,
+            )
         finally:
             listener.close()
     except (LiveTradingLocked, KiwoomError) as exc:

@@ -115,6 +115,10 @@ class Engine:
             self._seq += 1
             record, fill = self.broker.submit(f"{self._seq:04d}", intent, snap, self.settings)
             self.journal.order(record)
+            if record.status == "rejected":
+                self._release(intent)
+                self.reject(now, intent.code, intent.side, "주문 거절", record.note)
+                continue
             if record.status in {"accepted", "dry_run"}:
                 if record.status == "dry_run":
                     self._release(intent)
