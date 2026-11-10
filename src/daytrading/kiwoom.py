@@ -11,6 +11,7 @@ import json
 import urllib.error
 import urllib.request
 from typing import Any
+from urllib.parse import urlsplit
 
 PAPER_REST = "https://mockapi.kiwoom.com"
 LIVE_REST = "https://api.kiwoom.com"
@@ -43,6 +44,28 @@ MARKET = "3"
 
 class LiveTradingLocked(RuntimeError):
     """v0는 실전 주소를 열지 않는다."""
+
+
+ORDER_API_IDS = frozenset({TR_BUY, TR_SELL, TR_MODIFY, TR_CANCEL})
+
+
+def require_paper_order_url(url: str | None) -> None:
+    """주문 URL의 호스트가 mockapi.kiwoom.com 과 글자가 같을 때만 통과한다.
+
+    대소문자, 끝의 점, 포트, 다른 스킴, 사용자 정보, 서브도메인 변형은 거절한다.
+    설정의 live_trading_enabled 는 보지 않는다.
+    """
+    text = "" if url is None else str(url).strip()
+    parts = urlsplit(text)
+    allowed = (
+        parts.scheme == "https"
+        and parts.port is None
+        and not parts.username
+        and not parts.password
+        and parts.netloc == "mockapi.kiwoom.com"
+    )
+    if not allowed:
+        raise LiveTradingLocked("모의투자 서버(mockapi.kiwoom.com)로만 주문할 수 있습니다.")
 
 
 class KiwoomError(RuntimeError):
@@ -312,6 +335,28 @@ class KiwoomClient:
         body = order_body(code=code, qty=qty, limit_price=limit_price, market=market)
         return self._post(ORDER_PATH, body, api_id=api_id, auth=True)
 
+    def modify(self, code: str, orig_ord_no: str, qty: int, limit_price: int, exchange: str = "KRX") -> dict[str, Any]:
+        """kt10002 공식 예제와 같은 필드. 호스트 검사는 전송 직전에 한다."""
+        body = {
+            "dmst_stex_tp": exchange,
+            "orig_ord_no": str(orig_ord_no),
+            "stk_cd": normalize_code(code),
+            "mdfy_qty": str(int(qty)),
+            "mdfy_uv": str(int(limit_price)),
+            "mdfy_cond_uv": "",
+        }
+        return self._post(ORDER_PATH, body, api_id=TR_MODIFY, auth=True)
+
+    def cancel(self, code: str, orig_ord_no: str, qty: int, exchange: str = "KRX") -> dict[str, Any]:
+        """kt10003 공식 예제와 같은 필드. 호스트 검사는 전송 직전에 한다."""
+        body = {
+            "dmst_stex_tp": exchange,
+            "orig_ord_no": str(orig_ord_no),
+            "stk_cd": normalize_code(code),
+            "cncl_qty": str(int(qty)),
+        }
+        return self._post(ORDER_PATH, body, api_id=TR_CANCEL, auth=True)
+
     def volume_rank(self) -> dict[str, Any]:
         return self._post(RANK_PATH, volume_surge_body(), api_id=TR_VOLUME_SURGE, auth=True)
 
@@ -365,7 +410,12 @@ class KiwoomClient:
             if not self.token:
                 raise KiwoomError("토큰이 없습니다.")
             headers = request_headers(self.token, api_id, cont_yn=cont_yn, next_key=next_key)
-        request = urllib.request.Request(self.base_url + path, data=data, headers=headers, method="POST")
+        ordering = api_id in ORDER_API_IDS or path == ORDER_PATH
+        if ordering:
+            require_paper_order_url(self.base_url)
+        request = urllib.request.Request(f"{self.base_url}{path}", data=data, headers=headers, method="POST")
+        if ordering:
+            require_paper_order_url(request.full_url)
         try:
             with self._opener(request, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
@@ -380,3 +430,29 @@ class KiwoomClient:
         if not isinstance(payload, dict):
             raise KiwoomError("키움 응답이 객체가 아닙니다.")
         return payload, response_headers
+
+
+def check_live_order_block() -> int:
+    """실전 주소로 place()를 호출해 요청 전에 거절되는지만 본다. 키와 네트워크는 쓰지 않는다."""
+    import sys
+
+    opened: list[str] = []
+
+    def opener(request, timeout=10):
+        opened.append(getattr(request, "full_url", ""))
+        raise RuntimeError("주문을 보내면 안 됩니다.")
+
+    client = KiwoomClient("unused", "unused", mode="paper", opener=opener)
+    client.token = "unused"
+    client.base_url = LIVE_REST
+    try:
+        client.place("buy", "005930", 1, 0, True)
+    except LiveTradingLocked as exc:
+        if opened:
+            print("실전 주소로 주문 요청이 나갔습니다.", file=sys.stderr)
+            return 1
+        print(f"실전 주문 거절: {exc}")
+        print(f"주소 {LIVE_REST} 로는 주문을 보내지 않았습니다.")
+        return 0
+    print("실전 주소로 주문이 허용되었습니다.", file=sys.stderr)
+    return 1

@@ -17,6 +17,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--paper", action="store_true", help="키움 모의투자 서버에 접속해 같은 매매 엔진을 돌립니다.")
     parser.add_argument("--diagnose", action="store_true", help="모의 시세의 거래대금 단위와 진입 시각만 출력합니다. 주문은 내지 않습니다.")
     parser.add_argument("--smoke", action="store_true", help="모의 서버에만 1주 시장가 매수를 보내고, 장중이면 체결 수량만 팝니다.")
+    parser.add_argument("--check-live-block", action="store_true", help="실전 주소로 주문을 내면 요청 전에 거절되는지만 확인합니다. 키와 네트워크는 쓰지 않습니다.")
     parser.add_argument("--dry-run", action="store_true", help="--paper 와 함께 쓰면 주문 API를 호출하지 않습니다. 단독이면 --check 와 같습니다.")
     parser.add_argument("--home", type=Path, default=None, help="설정·로그 폴더. 비우면 사용자 홈의 .daytrading")
     parser.add_argument("--timemachine", action="store_true", help="가짜 분봉으로 Time Machine 을 돌립니다. 주문은 내지 않습니다.")
@@ -24,6 +25,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, default=None, help="Time Machine 결과 JSON 경로.")
     parser.add_argument("--png", type=Path, default=None, help="Time Machine 화면 PNG 경로.")
     args = parser.parse_args(argv)
+    if args.check_live_block:
+        from daytrading.kiwoom import check_live_order_block
+
+        return check_live_order_block()
     home = args.home or default_home()
     try:
         settings = SettingsStore(home).load()

@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from daytrading.kiwoom import (
@@ -82,3 +84,112 @@ def test_live_host_is_locked():
     assert client.base_url == PAPER_REST
     assert LIVE_REST not in client.base_url
     assert client.ws_url.startswith(PAPER_WS)
+
+
+class _OrderResponse:
+    def __init__(self, payload):
+        self.payload = json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self.payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class RecordingOpener:
+    def __init__(self):
+        self.requests = []
+
+    def __call__(self, request, timeout=10):
+        self.requests.append(request)
+        return _OrderResponse({"return_code": 0, "ord_no": "00024", "token": "tok"})
+
+
+def _order_client(base_url):
+    opener = RecordingOpener()
+    client = KiwoomClient("key", "secret", mode="paper", opener=opener)
+    client.token = "paper-token"
+    client.base_url = base_url
+    client.live_trading_enabled = True
+    return client, opener
+
+
+def test_place_modify_and_cancel_post_only_when_the_host_is_exactly_mock():
+    client, opener = _order_client(PAPER_REST)
+    client.place("buy", "005930", 1, 0, True)
+    client.place("sell", "005930", 1, 0, True)
+    client.modify("005930", "0000139", 1, 199700)
+    client.cancel("005930", "0000140", 1)
+    assert [request.full_url for request in opener.requests] == [PAPER_REST + "/api/dostk/ordr"] * 4
+    api_ids = [request.get_header("Api-id") for request in opener.requests]
+    assert api_ids == ["kt10000", "kt10001", "kt10002", "kt10003"]
+    bodies = [json.loads(request.data.decode("utf-8")) for request in opener.requests]
+    assert bodies[2]["orig_ord_no"] == "0000139"
+    assert bodies[2]["mdfy_qty"] == "1"
+    assert bodies[2]["mdfy_uv"] == "199700"
+    assert bodies[3]["orig_ord_no"] == "0000140"
+    assert bodies[3]["cncl_qty"] == "1"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://api.kiwoom.com",
+        "https://api.kiwoom.com:443",
+        "https://API.KIWOOM.COM",
+        "",
+        None,
+        "https://evil.example",
+        "https://MockAPI.kiwoom.com",
+        "https://MOCKAPI.KIWOOM.COM",
+        "https://mockapi.kiwoom.com.",
+        "https://mockapi.kiwoom.com:443",
+        "https://mockapi.kiwoom.com:8443",
+        "https://mockapi.kiwoom.com.evil.com",
+        "https://evil.mockapi.kiwoom.com",
+        "http://mockapi.kiwoom.com",
+        "https://user:pass@mockapi.kiwoom.com",
+    ],
+)
+def test_order_paths_refuse_before_any_http_call(base_url):
+    client, opener = _order_client(base_url)
+    for call in (
+        lambda: client.place("buy", "005930", 1, 0, True),
+        lambda: client.modify("005930", "0000139", 1, 199700),
+        lambda: client.cancel("005930", "0000140", 1),
+    ):
+        with pytest.raises(LiveTradingLocked):
+            call()
+    assert opener.requests == []
+
+
+def test_token_and_rank_queries_are_not_blocked_by_the_order_host_gate():
+    client, opener = _order_client(LIVE_REST)
+    assert client.issue_token() == "tok"
+    assert opener.requests[0].full_url == LIVE_REST + "/oauth2/token"
+
+
+def test_check_live_block_command_rejects_without_network_or_secrets(tmp_path, monkeypatch, capsys):
+    from daytrading.__main__ import main
+
+    monkeypatch.setenv("KIWOOM_APP_KEY", "LIVESECRETKEY")
+    monkeypatch.setenv("KIWOOM_APP_SECRET", "LIVESECRETVALUE")
+
+    def secrets_must_not_be_read(*args, **kwargs):
+        raise AssertionError("secrets were read")
+
+    def network_must_not_open(*args, **kwargs):
+        raise AssertionError("network was opened")
+
+    monkeypatch.setattr("daytrading.secrets.load_secrets", secrets_must_not_be_read)
+    monkeypatch.setattr("urllib.request.urlopen", network_must_not_open)
+    code = main(["--check-live-block", "--home", str(tmp_path)])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "거절" in captured.out
+    assert "api.kiwoom.com" in captured.out
+    assert "LIVESECRET" not in captured.out + captured.err
