@@ -59,6 +59,10 @@ def normalize_code(code: str) -> str:
     return text
 
 
+# 주식체결(0B) FID 14 누적거래대금. 공식 명세 description은 "단위: 백만원".
+ACC_VALUE_UNIT_KRW = 1_000_000
+
+
 def signed_price(value: Any) -> int | None:
     """현재가 FID는 '+82000' '-82000'처럼 부호가 붙는다. 가격은 절대값이다."""
     if value is None:
@@ -70,6 +74,14 @@ def signed_price(value: Any) -> int | None:
     if not digits.replace(".", "", 1).isdigit():
         return None
     return int(abs(float(digits)))
+
+
+def trading_value_krw(value: Any) -> int | None:
+    """0B 14를 원으로 바꾼다. 명세의 단위는 백만원이고 설정 하한은 원이다."""
+    raw = signed_price(value)
+    if raw is None:
+        return None
+    return raw * ACC_VALUE_UNIT_KRW
 
 
 def order_body(
@@ -208,7 +220,7 @@ def parse_real_messages(message: dict[str, Any]) -> list[dict[str, Any]]:
                     "open": signed_price(values.get("16")),
                     "high": signed_price(values.get("17")),
                     "low": signed_price(values.get("18")),
-                    "acc_value": signed_price(values.get("14")),
+                    "acc_value": trading_value_krw(values.get("14")),
                     "acc_volume": signed_price(values.get("13")),
                     "strength": _float(values.get("228")),
                     "best_ask": signed_price(values.get("27")),

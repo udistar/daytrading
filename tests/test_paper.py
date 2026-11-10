@@ -248,7 +248,7 @@ def test_entry_block_is_written_once_per_minute_without_a_breakout(tmp_path):
             "code": "005930",
             "side": "buy",
             "reason": "종목 정보 없음",
-            "detail": "",
+            "detail": "flags_known=false",
         }
     ]
     assert socket.messages == []

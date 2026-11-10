@@ -50,6 +50,31 @@ def test_websocket_packets_and_signed_price():
     assert normalize_code("005930_NX") == "005930"
 
 
+def test_official_0b_example_scales_cumulative_value_from_million_won_to_won():
+    """키움 공식 주식체결(0B) 예제. 14는 백만원, 13은 1주, 10은 원.
+
+    632640백만원 / 30379732주 = 약 20824원으로, 체결가 20800원과 맞다.
+    원으로 바꾸기 전에는 누적대금이 632640원이 되어 기본 누적 하한(50억)을 항상 넘지 못한다.
+    """
+    events = parse_real_messages(
+        {
+            "trnm": "REAL",
+            "data": [
+                {
+                    "type": "0B",
+                    "item": "005930",
+                    "values": {"10": "-20800", "13": "30379732", "14": "632640"},
+                }
+            ],
+        }
+    )
+    acc = events[0]["acc_value"]
+    assert acc == 632_640 * 1_000_000
+    assert acc >= 5_000_000_000
+    implied = acc / 30_379_732
+    assert abs(implied - 20_800) < 100
+
+
 def test_live_host_is_locked():
     with pytest.raises(LiveTradingLocked):
         KiwoomClient("key", "secret", mode="live")

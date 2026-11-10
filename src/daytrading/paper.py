@@ -397,8 +397,8 @@ def _evaluate_dirty(engine: Engine, now: datetime, seen: dict) -> None:
         intents, blocked = evaluate(snap, engine.portfolio, engine.settings, seen=seen)
         book.prev_price = book.last_price
         book.dirty = False
-        for blocked_code, reason in blocked:
-            engine.reject(now, blocked_code, "buy", reason)
+        for blocked_code, reason, detail in blocked:
+            engine.reject(now, blocked_code, "buy", reason, detail)
         for intent in intents:
             engine._clock = now
             engine.enqueue(intent)

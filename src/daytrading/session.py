@@ -219,9 +219,9 @@ def run_ticks(engine: Engine, ticks: list, controls: dict | None = None) -> dict
             intents, blocked = evaluate(snap, engine.portfolio, engine.settings, seen=seen)
             book.prev_price = book.last_price
             book.dirty = False
-            for blocked_code, reason in blocked:
+            for blocked_code, reason, detail in blocked:
                 side = "buy"
-                engine.reject(cursor, blocked_code, side, reason)
+                engine.reject(cursor, blocked_code, side, reason, detail)
             for intent in intents:
                 engine._clock = cursor
                 engine.enqueue(intent)

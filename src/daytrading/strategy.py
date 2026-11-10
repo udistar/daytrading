@@ -18,12 +18,23 @@ def _floor_price(value: float) -> int:
     return int(math.floor(value + 1e-9))
 
 
-def entry_block_reason(snap: Snapshot, settings: Settings, portfolio: Portfolio) -> str | None:
-    now = snap.ts.time()
+def entry_time_block(moment: datetime, settings: Settings) -> str | None:
+    """스냅샷 시각이 신규 진입 창 밖이면 그 사유. 창 안이면 None.
+
+    비교는 한국 시각의 시·분·초만 본다. 실행을 시작한 구간 이름과는 따로다.
+    """
+    now = moment.time()
     if now < settings.clock("entry_start"):
         return "신규 진입 시간 전"
     if now >= settings.clock("entry_end"):
         return "신규 진입 마감"
+    return None
+
+
+def entry_block_reason(snap: Snapshot, settings: Settings, portfolio: Portfolio) -> str | None:
+    blocked = entry_time_block(snap.ts, settings)
+    if blocked:
+        return blocked
     if snap.code in portfolio.traded_today and not settings.allow_reentry_same_day:
         return "당일 재진입 안 함"
     if snap.code in portfolio.positions and portfolio.positions[snap.code].qty > 0:
@@ -101,6 +112,72 @@ def _buy_qty(amount: int, limit_price: int) -> int:
 def _limit_buy(snap: Snapshot, settings: Settings) -> int:
     tick = tick_size(settings, snap.best_ask or snap.price)
     return (snap.best_ask or snap.price) + tick * int(settings.entry_tick_offset)
+
+
+def _won(value: int | float | None) -> str:
+    if value is None:
+        return "없음"
+    return f"{int(value)}원"
+
+
+def _pct_text(value: float | None) -> str:
+    if value is None:
+        return "없음"
+    return f"{value:.2f}%"
+
+
+def entry_measurement(snap: Snapshot, settings: Settings, reason: str) -> str:
+    """거절 사유 옆에 붙일 측정값. 사유 문자열은 그대로 두고 숫자만 따로 남긴다."""
+    if reason in {"신규 진입 시간 전", "신규 진입 마감"}:
+        start = settings.clock("entry_start").strftime("%H:%M:%S")
+        end = settings.clock("entry_end").strftime("%H:%M:%S")
+        return f"시각 {snap.ts.strftime('%H:%M:%S')} / 진입 {start}~{end}"
+    if reason == "상장 일수 부족" and snap.meta.listed_on is not None:
+        age = (snap.ts.date() - snap.meta.listed_on).days
+        return f"측정 {age}일 / 기준 {int(settings.listing_age_min_days)}일"
+    if reason == "주가 범위 밖":
+        return f"측정 {snap.price}원 / 범위 {int(settings.price_min_krw)}~{int(settings.price_max_krw)}원"
+    if reason == "전일대비 범위 밖":
+        return (
+            f"측정 {_pct_text(snap.change_prev_pct)} / "
+            f"범위 {settings.change_prev_min_pct:.2f}~{settings.change_prev_max_pct:.2f}%"
+        )
+    if reason == "시가대비 부족":
+        return f"측정 {_pct_text(snap.change_open_pct)} / 기준 {settings.change_open_min_pct:.2f}%"
+    if reason == "시가 갭 제외":
+        return f"측정 {_pct_text(snap.gap_pct)} / 기준 {settings.gap_exclude_above_pct:.2f}%"
+    if reason == "상한가 근접":
+        upper = snap.upper_limit
+        if upper <= 0 and snap.prev_close > 0:
+            upper = _floor_price(_pct(snap.prev_close, settings.limit_up_ratio_pct))
+        left = "" if upper <= 0 else _pct_text((upper - snap.price) / upper * 100)
+        return f"측정 {left or '없음'} / 기준 {settings.limit_up_proximity_pct:.2f}%"
+    if reason == "누적 거래대금 부족":
+        return f"측정 {_won(snap.acc_value)} / 기준 {_won(settings.cumulative_value_min_krw)}"
+    if reason == "1분 거래대금 평균 표본 부족":
+        return f"측정 {snap.minute_samples}개 / 기준 {int(settings.minute_value_lookback_min)}개"
+    if reason == "1분 거래대금 부족":
+        return f"측정 {_won(snap.minute_value)} / 기준 {_won(settings.minute_value_min_krw)}"
+    if reason == "1분 거래대금 배수 부족":
+        return (
+            f"측정 {_won(snap.minute_value)} / 평균 {_won(snap.avg_minute_value)} / "
+            f"배수 {settings.minute_value_multiple:.2f}"
+        )
+    if reason == "체결강도 부족":
+        got = "없음" if snap.strength is None else f"{snap.strength:.2f}"
+        return f"측정 {got} / 기준 {settings.strength_min:.2f}"
+    if reason == "스프레드 큼":
+        return f"측정 {_pct_text(snap.spread_pct)} / 기준 {settings.spread_max_pct:.2f}%"
+    if reason == "매수/매도 잔량비 초과":
+        ratio = "없음" if snap.bid_ask_ratio is None else f"{snap.bid_ask_ratio:.2f}"
+        return f"측정 {ratio} / 기준 {settings.bid_ask_ratio_max:.2f} / 매수잔량 {snap.bid_qty} / 매도잔량 {snap.ask_qty}"
+    if reason == "돌파 고가 표본 부족":
+        return f"측정 {len(snap.completed_bars)}개 / 기준 {int(settings.breakout_lookback_min)}개"
+    if reason == "직전 고가 돌파 아님":
+        return f"이전가 {snap.prev_price} / 고가 {snap.breakout_high} / 현재가 {snap.price}"
+    if reason == "종목 정보 없음":
+        return "flags_known=false"
+    return ""
 
 
 def maybe_entry(snap: Snapshot, settings: Settings, portfolio: Portfolio) -> Intent | None:
@@ -341,14 +418,14 @@ def evaluate(
     portfolio: Portfolio,
     settings: Settings,
     seen: dict | None = None,
-) -> tuple[list[Intent], list[tuple[str, str]]]:
-    """의도와, 신규 매수가 막힌 (코드, 사유) 목록을 돌려준다.
+) -> tuple[list[Intent], list[tuple[str, str, str]]]:
+    """의도와, 신규 매수가 막힌 (코드, 사유, 측정값) 목록을 돌려준다.
 
     돌파 여부와 상관없이 entry_block_reason 을 남긴다.
     seen 을 넘기면 종목·사유·분마다 한 번만 넣는다.
     """
     position = portfolio.positions.get(snap.code)
-    rejections: list[tuple[str, str]] = []
+    rejections: list[tuple[str, str, str]] = []
     if position and position.qty > 0:
         room = portfolio.sell_room(snap.code)
         if room <= 0:
@@ -370,14 +447,14 @@ def evaluate(
         if position.buy_count < len(levels):
             trigger, _amount = levels[position.buy_count]
             if snap.price >= _pct(position.entry_price, trigger):
-                rejections.append((snap.code, blocked))
+                rejections.append((snap.code, blocked, ""))
         return [], rejections
     if snap.code in portfolio.pending_buys:
         return [], rejections
     blocked = entry_block_reason(snap, settings, portfolio)
     if blocked:
         if seen is None or remember_entry_rejection(seen, snap.ts, snap.code, blocked):
-            rejections.append((snap.code, blocked))
+            rejections.append((snap.code, blocked, entry_measurement(snap, settings, blocked)))
         return [], rejections
     entry = maybe_entry(snap, settings, portfolio)
     return ([entry] if entry else []), rejections
