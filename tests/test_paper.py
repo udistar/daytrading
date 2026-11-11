@@ -306,6 +306,9 @@ def test_run_paper_subscribes_and_does_not_place_orders_on_dry_run(tmp_path):
     sent = " ".join(socket.sent)
     assert "REG" in sent
     assert "005930" in sent
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["scenario"] == "paper"
+    assert (tmp_path / "summary.txt").exists()
 
 
 def _trade(code="005930"):

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from daytrading.timeutil import KST, parse_hms
@@ -139,7 +140,18 @@ SCHEMA: tuple[Field, ...] = (
     _f("paper_fill_poll_seconds", "모의 체결 조회 간격 (초)", "호출제한", "int", 3, 1, 120, "주문체결 실시간(00)이 없어도 kt00007·kt00018로 보유를 맞춥니다."),
     _f("condition_max", "실시간 조건검색 최대 개수", "호출제한", "int", 10, 1, 10),
     _f("condition_seqs", "영웅문4 조건식 일련번호", "호출제한", "str", "", help="쉼표로 구분. 예: 0,1,2. 비우면 순위 조회만 사용합니다."),
-    _f("commission_rate_pct", "매매 수수료 (%, 편도)", "비용", "float", 0.015, 0.0, 1.0, "키움 FAQ 기준 0.015%. 계좌 요율에 맞게 바꾸세요.", 4),
+    _f("commission_rate_pct", "매매 수수료 (%, 편도)", "비용", "float", 0.015, 0.0, 1.0, "키움 FAQ 기준 0.015%. 시뮬레이션에 씁니다. 모의 호스트는 아래 모의 수수료를 씁니다.", 4),
+    _f(
+        "paper_commission_rate_pct",
+        "모의 매매 수수료 (%, 편도)",
+        "비용",
+        "float",
+        0.35,
+        0.0,
+        2.0,
+        "모의 호스트의 체결·실현손익에 씁니다. 키움 모의투자는 편도 0.35%입니다(2008-12-12부터, 무위험 호가차익 방지). REST 명세에는 요율이 없고, 2026-11-11 ka10074 조회(매수 14,742,380원+매도 15,120,880원, trde_cmsn 104,520원)가 편도 0.35%와 1원 차로 맞습니다. commission_rate_pct가 0.015여도 모의 호스트는 이 값을 씁니다.",
+        4,
+    ),
     _f("sell_tax_rate_pct", "매도세 (%, 거래세+농특세)", "비용", "float", 0.20, 0.0, 1.0, "비교 문서 기준 코스피·코스닥 매도세 0.20%.", 4),
     _f("sim_adverse_ticks", "시뮬레이션 불리 틱", "비용", "int", 1, 0, 10, "모의 체결을 이 틱만큼 불리하게 잡습니다."),
     _f(
@@ -215,6 +227,22 @@ class Settings:
 
 def default_settings() -> Settings:
     return Settings({field.key: field.default for field in SCHEMA})
+
+
+def on_paper_host(base_url: str | None) -> bool:
+    """주문 잠금과 같은 기준. 호스트 문자열이 mockapi.kiwoom.com 일 때만 모의다."""
+    return urlsplit(str(base_url or "")).netloc == "mockapi.kiwoom.com"
+
+
+def commission_pct(settings: Settings, *, paper_host: bool) -> float:
+    """모의 호스트는 paper_commission_rate_pct. 저장된 실전 요율은 바꾸지 않는다."""
+    if paper_host:
+        return float(settings.paper_commission_rate_pct)
+    return float(settings.commission_rate_pct)
+
+
+def trade_fee_krw(notional: int, settings: Settings, *, paper_host: bool) -> int:
+    return int(round(int(notional) * commission_pct(settings, paper_host=paper_host) / 100))
 
 
 def parse_tick_rules(text: str) -> list[tuple[int, int]]:

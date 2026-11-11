@@ -105,6 +105,7 @@ ALTERNATES = {
     "condition_max": 4,
     "condition_seqs": "0,1",
     "commission_rate_pct": 0.02,
+    "paper_commission_rate_pct": 0.25,
     "sell_tax_rate_pct": 0.18,
     "sim_adverse_ticks": 2,
     "tick_rules": "2000:1,5000:5,20000:10,50000:50,200000:100,500000:500,1000000000:500",

@@ -33,7 +33,7 @@ from daytrading.meta import FLAG_FIELDS, load_symbol_meta, refresh_symbol_meta
 from daytrading.models import Fill, Intent, OrderRecord, Snapshot, SymbolMeta
 from daytrading.secrets import load_secrets, missing_secret_names
 from daytrading.session import Engine
-from daytrading.settings import Settings, price_band
+from daytrading.settings import Settings, price_band, trade_fee_krw
 from daytrading.timeutil import KST
 
 
@@ -369,7 +369,7 @@ def _apply_notice(engine: Engine, event: dict[str, Any], now: datetime) -> None:
     if remembered:
         trigger = int(remembered)
     notional = price * qty
-    fee = int(round(notional * engine.settings.commission_rate_pct / 100))
+    fee = trade_fee_krw(notional, engine.settings, paper_host=_engine_on_paper_host(engine))
     tax = int(round(notional * engine.settings.sell_tax_rate_pct / 100)) if side == "sell" else 0
     slip = (trigger - price) * qty if side == "sell" else (price - trigger) * qty
     name = code
@@ -473,7 +473,15 @@ def run_paper(
         close = getattr(sock, "close", None)
         if close:
             close()
+        journal.write_summary(engine.summary())
     return engine
+
+
+def _engine_on_paper_host(engine: Engine) -> bool:
+    from daytrading.settings import on_paper_host
+
+    client = getattr(engine.broker, "client", None)
+    return on_paper_host(getattr(client, "base_url", None))
 
 
 def _settle_working(engine: Engine, now: datetime) -> None:
@@ -506,7 +514,7 @@ def _book_synced_fill(engine: Engine, spec: dict, now: datetime) -> None:
     if remembered:
         trigger = int(remembered)
     notional = price * qty
-    fee = int(round(notional * engine.settings.commission_rate_pct / 100))
+    fee = trade_fee_krw(notional, engine.settings, paper_host=_engine_on_paper_host(engine))
     tax = int(round(notional * engine.settings.sell_tax_rate_pct / 100)) if side == "sell" else 0
     slip = (trigger - price) * qty if side == "sell" else (price - trigger) * qty
     fill = Fill(

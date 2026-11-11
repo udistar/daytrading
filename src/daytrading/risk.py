@@ -9,14 +9,20 @@ from daytrading.settings import Settings
 from daytrading.timeutil import add_seconds, seconds_between
 
 
-def mark_to_market(portfolio: Portfolio, prices: dict[str, int], settings: Settings) -> int:
+def mark_to_market(
+    portfolio: Portfolio,
+    prices: dict[str, int],
+    settings: Settings,
+    commission_pct: float | None = None,
+) -> int:
+    rate = float(settings.commission_rate_pct if commission_pct is None else commission_pct)
     unrealized = 0
     for code, position in portfolio.positions.items():
         if position.qty <= 0:
             continue
         price = prices.get(code, position.last_add_price)
         gross = price * position.qty
-        fee = int(round(gross * settings.commission_rate_pct / 100))
+        fee = int(round(gross * rate / 100))
         tax = int(round(gross * settings.sell_tax_rate_pct / 100))
         unrealized += gross - fee - tax - position.cost_krw
     return portfolio.realized_krw + unrealized
@@ -57,6 +63,7 @@ def veto_buy(
     snap: Snapshot | None,
     now: datetime,
     pnl: int,
+    commission_pct: float | None = None,
 ) -> str | None:
     if intent.side != "buy":
         return None
@@ -99,7 +106,8 @@ def veto_buy(
     if invested + intent.amount_krw > settings.per_stock_cap_krw:
         return "종목당 금액 한도"
     reserved = sum(amount for code, amount in portfolio.pending_buy_amount.items() if code != intent.code)
-    fee = int(round(intent.amount_krw * settings.commission_rate_pct / 100))
+    rate = float(settings.commission_rate_pct if commission_pct is None else commission_pct)
+    fee = int(round(intent.amount_krw * rate / 100))
     if reserved + intent.amount_krw + fee > portfolio.cash:
         return "현금 부족"
     blocked = vi_buy_block(snap, settings, now)
