@@ -16,7 +16,9 @@ class RateGate:
         self.rate = float(settings.token_bucket_per_sec)
         self.tokens = self.rate
         self.updated: datetime | None = None
-        self.tr_interval = 1.0 / float(settings.paper_tr_per_sec)
+        per_tr = 1.0 / float(settings.paper_tr_per_sec)
+        per_id = float(settings.api_id_min_interval_seconds)
+        self.tr_interval = max(per_tr, per_id)
         self.tr_last: dict[str, datetime] = {}
 
     def bucket_ready(self, now: datetime) -> bool:

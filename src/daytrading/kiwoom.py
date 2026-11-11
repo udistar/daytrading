@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -44,7 +45,33 @@ LIMIT_REGULAR = "0"
 MARKET = "3"
 ACNT_PATH = "/api/dostk/acnt"
 TR_ORDER_DETAIL = "kt00007"
+TR_ORDER_STATUS = "kt00009"
 TR_BALANCE = "kt00018"
+
+# 키움 공지 https://i.kiwoom.com/restapi_notice_261109 (2026-11-09, seqid 68).
+# 2026-11-12 18시 이후 국내주식 계좌 TR은 초당 5회에서 TR별 초당 1회가 된다.
+# 목록은 공지 본문 이미지 261109115800727LSKE.png 의 19개다.
+ACCOUNT_FLOW_TR_IDS = (
+    "kt00001",
+    "kt00002",
+    "kt00003",
+    "kt00004",
+    "kt00005",
+    "kt00007",
+    "kt00008",
+    "kt00009",
+    "kt50031",
+    "kt50075",
+    "kt00013",
+    "kt00015",
+    "kt00016",
+    "kt00017",
+    "kt00018",
+    "kt50020",
+    "kt50021",
+    "kt50030",
+    "kt50032",
+)
 
 
 class LiveTradingLocked(RuntimeError):
@@ -75,6 +102,10 @@ def require_paper_order_url(url: str | None) -> None:
 
 class KiwoomError(RuntimeError):
     pass
+
+
+class FlowLimited(KiwoomError):
+    """return_code 5, 1700, 또는 HTTP 429. 호출 간격을 두고 다시 시도한다."""
 
 
 def normalize_code(code: str) -> str:
@@ -155,6 +186,20 @@ def balance_body() -> dict[str, str]:
     return {"qry_tp": "1", "dmst_stex_tp": "KRX"}
 
 
+def order_status_body(stk_cd: str = "") -> dict[str, str]:
+    """kt00009 공식 예제. qry_tp 0은 전체라 미체결 접수도 포함한다."""
+    return {
+        "ord_dt": "",
+        "stk_bond_tp": "0",
+        "mrkt_tp": "0",
+        "sell_tp": "0",
+        "qry_tp": "0",
+        "stk_cd": normalize_code(stk_cd) if str(stk_cd).strip() else "",
+        "fr_ord_no": "",
+        "dmst_stex_tp": "KRX",
+    }
+
+
 def order_fill_reg_packet(grp_no: str = "2") -> dict[str, Any]:
     """주문체결(00)을 시세 그룹과 따로 등록한다. 공식 예제의 type은 00, item은 빈 값이다."""
     return {
@@ -210,6 +255,86 @@ def parse_order_detail_rows(payload: object) -> list[dict[str, Any]]:
             }
         )
     return parsed
+
+
+def parse_order_status_rows(payload: object) -> list[dict[str, Any]]:
+    """kt00009 acnt_ord_cntr_prst_array. 주문수량·종목·매매구분으로 접수를 찾는다."""
+    rows = payload.get("acnt_ord_cntr_prst_array") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return []
+    parsed = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        parsed.append(
+            {
+                "ord_no": str(row.get("ord_no") or "").strip(),
+                "code": normalize_code(str(row.get("stk_cd") or "")),
+                "side": _order_side(row.get("io_tp_nm")),
+                "ord_qty": padded_int(row.get("ord_qty")),
+                "mdfy_cncl": str(row.get("mdfy_cncl_tp") or ""),
+            }
+        )
+    return parsed
+
+
+def match_unseen_orders(rows: list[dict[str, Any]], *, code: str, qty: int, side: str, known: set[str]) -> list[str]:
+    """이 프로세스가 아직 모르는, 같은 종목·수량·방향의 주문번호."""
+    target = normalize_code(code)
+    found = []
+    for row in rows:
+        if row["code"] != target or int(row["ord_qty"]) != int(qty):
+            continue
+        if side and row["side"] and row["side"] != side:
+            continue
+        if "취소" in row["mdfy_cncl"]:
+            continue
+        if order_key(row["ord_no"]) in known:
+            continue
+        found.append(str(row["ord_no"]))
+    return found
+
+
+def flow_limited(payload: object, http_status: int | None = None) -> bool:
+    """429. return_code 5 또는 메시지 안의 1700."""
+    if http_status == 429:
+        return True
+    if not isinstance(payload, dict):
+        return False
+    message = str(payload.get("return_msg") or "")
+    if str(payload.get("return_code")) == "5":
+        return True
+    return "1700" in message
+
+
+class ApiIdGate:
+    """API ID마다 최소 간격을 둔다. 주문 큐의 전체 초당 상한과는 별도로 적용한다."""
+
+    def __init__(self, min_interval: float = 1.0, sleeper=None, clock=None):
+        self.min_interval = float(min_interval)
+        self._sleep = sleeper or time.sleep
+        self._now = clock or time.monotonic
+        self._last: dict[str, float] = {}
+
+    def wait(self, api_id: str) -> None:
+        interval = self.min_interval
+        if interval <= 0:
+            return
+        now = self._now()
+        last = self._last.get(api_id)
+        if last is not None:
+            delay = interval - (now - last)
+            if delay > 1e-9:
+                self._sleep(delay)
+                now = self._now()
+        self._last[api_id] = now
+
+
+def call_limit_kwargs(settings) -> dict[str, float | int]:
+    return {
+        "min_interval": float(settings.api_id_min_interval_seconds),
+        "rate_retries": int(settings.api_rate_retry_count),
+    }
 
 
 def parse_balance_map(payload: object) -> dict[str, dict[str, int]]:
@@ -466,6 +591,27 @@ def _response_headers(response: Any) -> dict[str, str]:
     return {str(key).lower(): str(value) for key, value in items}
 
 
+def _json_object(text: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _error_text(payload: object, http_status: int | None = None, detail: str = "") -> str:
+    if isinstance(payload, dict) and (payload.get("return_code") not in (None, "") or payload.get("return_msg")):
+        code = payload.get("return_code")
+        message = str(payload.get("return_msg") or "")
+        text = message or str(code)
+        if code not in (None, "") and str(code) not in text:
+            text = f"[{code}] {message}".strip()
+        return text
+    if http_status:
+        return f"키움 호출 실패 ({http_status}): {detail[:300]}"
+    return detail[:300] or "키움 호출 실패"
+
+
 def _float(value: Any) -> float | None:
     if value is None or str(value).strip() == "":
         return None
@@ -479,7 +625,18 @@ def _float(value: Any) -> float | None:
 class KiwoomClient:
     """모의투자 REST. 네트워크는 호출자가 명시적으로 요청할 때만 연다."""
 
-    def __init__(self, app_key: str, app_secret: str, mode: str = "paper", opener=None):
+    def __init__(
+        self,
+        app_key: str,
+        app_secret: str,
+        mode: str = "paper",
+        opener=None,
+        *,
+        min_interval: float = 1.0,
+        rate_retries: int = 2,
+        sleeper=None,
+        clock=None,
+    ):
         if mode != "paper":
             raise LiveTradingLocked("v0에서는 실전 주소(api.kiwoom.com)로 접속할 수 없습니다.")
         if not app_key or not app_secret:
@@ -491,6 +648,9 @@ class KiwoomClient:
         self.ws_url = PAPER_WS + WS_PATH
         self.token = ""
         self._opener = opener or urllib.request.urlopen
+        self._gate = ApiIdGate(min_interval, sleeper=sleeper, clock=clock)
+        self._rate_retries = max(0, int(rate_retries))
+        self._known_order_nos: set[str] = set()
 
     def issue_token(self) -> str:
         payload = self._post(TOKEN_PATH, token_body(self.app_key, self.app_secret), api_id=TR_TOKEN, auth=False)
@@ -520,6 +680,10 @@ class KiwoomClient:
     def balance(self) -> dict[str, Any]:
         """kt00018 계좌평가잔고. 조회라 주문 호스트 잠금은 타지 않는다."""
         return self._post(ACNT_PATH, balance_body(), api_id=TR_BALANCE, auth=True)
+
+    def order_status(self, stk_cd: str = "") -> dict[str, Any]:
+        """kt00009 계좌별주문체결현황. 주문 재시도 전에 접수 여부를 볼 때 쓴다."""
+        return self._post(ACNT_PATH, order_status_body(stk_cd), api_id=TR_ORDER_STATUS, auth=True, retries=0)
 
     def modify(self, code: str, orig_ord_no: str, qty: int, limit_price: int, exchange: str = "KRX") -> dict[str, Any]:
         """kt10002 공식 예제와 같은 필드. 호스트 검사는 전송 직전에 한다."""
@@ -576,8 +740,8 @@ class KiwoomClient:
         items = [row for row in rows if isinstance(row, dict)]
         return items, headers.get("cont-yn", "N"), headers.get("next-key", "")
 
-    def _post(self, path: str, body: dict, api_id: str, auth: bool) -> dict[str, Any]:
-        payload, _headers = self._exchange(path, body, api_id=api_id, auth=auth)
+    def _post(self, path: str, body: dict, api_id: str, auth: bool, retries: int | None = None) -> dict[str, Any]:
+        payload, _headers = self._exchange(path, body, api_id=api_id, auth=auth, retries=retries)
         return payload
 
     def _exchange(
@@ -589,6 +753,75 @@ class KiwoomClient:
         cont_yn: str = "N",
         next_key: str = "",
         timeout: float = 10,
+        retries: int | None = None,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        attempts = self._rate_retries if retries is None else max(0, int(retries))
+        ordering = api_id in ORDER_API_IDS or path == ORDER_PATH
+        if ordering:
+            require_paper_order_url(self.base_url)
+        last_error: KiwoomError | None = None
+        for attempt in range(attempts + 1):
+            if attempt and ordering and api_id in {TR_BUY, TR_SELL}:
+                found, sure = self._accepted_order(body, api_id)
+                if found:
+                    self._known_order_nos.add(order_key(found))
+                    return {"return_code": 0, "ord_no": found, "return_msg": "이미 접수된 주문"}, {}
+                if not sure:
+                    if attempt >= attempts:
+                        if last_error is not None:
+                            raise last_error
+                        raise KiwoomError("주문 접수 여부를 확인하지 못했습니다.")
+                    continue
+            self._gate.wait(api_id)
+            try:
+                payload, response_headers = self._read_response(
+                    path, body, api_id, auth, cont_yn, next_key, timeout
+                )
+            except FlowLimited as exc:
+                last_error = exc
+                if attempt >= attempts:
+                    raise
+                continue
+            if ordering:
+                number = str(payload.get("ord_no") or "").strip()
+                if number:
+                    self._known_order_nos.add(order_key(number))
+            return payload, response_headers
+        if last_error is not None:
+            raise last_error
+        raise KiwoomError("키움 호출에 실패했습니다.")
+
+    def _accepted_order(self, body: dict, api_id: str) -> tuple[str | None, bool]:
+        """재전송 전에 kt00009로 접수를 확인한다. 조회가 실패하면 다시 보내지 않는다."""
+        side = "buy" if api_id == TR_BUY else "sell"
+        code = str(body.get("stk_cd") or "")
+        qty = padded_int(body.get("ord_qty"))
+        try:
+            payload = self.order_status(code)
+        except KiwoomError:
+            return None, False
+        matches = match_unseen_orders(
+            parse_order_status_rows(payload),
+            code=code,
+            qty=qty,
+            side=side,
+            known=self._known_order_nos,
+        )
+        if len(matches) > 1:
+            raise KiwoomError("유량 초과 뒤 같은 종목·수량·방향의 주문이 둘 이상이라 다시 보내지 않습니다.")
+        if len(matches) == 1:
+            return matches[0], True
+        return None, True
+
+    def _read_response(
+        self,
+        path: str,
+        body: dict,
+        api_id: str,
+        auth: bool,
+        cont_yn: str,
+        next_key: str,
+        timeout: float,
     ) -> tuple[dict[str, Any], dict[str, str]]:
         data = json.dumps(body).encode("utf-8")
         headers = {"Content-Type": "application/json;charset=UTF-8", "api-id": api_id}
@@ -597,8 +830,6 @@ class KiwoomClient:
                 raise KiwoomError("토큰이 없습니다.")
             headers = request_headers(self.token, api_id, cont_yn=cont_yn, next_key=next_key)
         ordering = api_id in ORDER_API_IDS or path == ORDER_PATH
-        if ordering:
-            require_paper_order_url(self.base_url)
         request = urllib.request.Request(f"{self.base_url}{path}", data=data, headers=headers, method="POST")
         if ordering:
             require_paper_order_url(request.full_url)
@@ -606,18 +837,19 @@ class KiwoomClient:
             with self._opener(request, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
                 response_headers = _response_headers(response)
+                status = getattr(response, "status", None)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
+            payload = _json_object(detail)
+            if flow_limited(payload, exc.code):
+                raise FlowLimited(_error_text(payload, exc.code, detail)) from exc
             raise KiwoomError(f"키움 호출 실패 ({exc.code}): {detail[:300]}") from exc
         except urllib.error.URLError as exc:
             raise KiwoomError(f"키움 서버에 연결하지 못했습니다: {exc.reason}") from exc
+        if flow_limited(payload, status if isinstance(status, int) else None):
+            raise FlowLimited(_error_text(payload))
         if isinstance(payload, dict) and payload.get("return_code") not in (None, 0, "0"):
-            code = payload.get("return_code")
-            message = str(payload.get("return_msg") or "")
-            text = message or str(code)
-            if code not in (None, "") and str(code) not in text:
-                text = f"[{code}] {message}".strip()
-            raise KiwoomError(text)
+            raise KiwoomError(_error_text(payload))
         if not isinstance(payload, dict):
             raise KiwoomError("키움 응답이 객체가 아닙니다.")
         return payload, response_headers

@@ -1,6 +1,6 @@
 import csv
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from daytrading.journal import Journal
 from daytrading.kiwoom import LIVE_REST, PAPER_REST, PAPER_WS, KiwoomClient, KiwoomError
@@ -547,3 +547,42 @@ class _MetaOpener:
         else:
             rows = []
         return Response({"return_code": 0, "list": rows}, {"cont-yn": "N", "next-key": ""})
+
+
+def test_fill_poll_does_not_repeat_inside_its_interval():
+    class Client:
+        def __init__(self):
+            self.base_url = PAPER_REST
+            self.calls = []
+
+        def order_detail(self, stk_cd=""):
+            self.calls.append("kt00007")
+            return {"acnt_ord_cntr_prps_dtl": []}
+
+        def balance(self):
+            self.calls.append("kt00018")
+            return {"acnt_evlt_remn_indv_tot": []}
+
+    client = Client()
+    broker = KiwoomBroker(client)
+    now = datetime(2026, 11, 11, 9, 10, tzinfo=KST)
+    broker.working["1"] = {
+        "ord_no": "1",
+        "code": "005930",
+        "side": "buy",
+        "qty": 1,
+        "filled": 0,
+        "limit_price": 100,
+        "placed_at": now,
+        "order_type": "limit_ioc",
+        "reason": "entry",
+        "cancel_sent": False,
+    }
+    settings = default_settings()
+    assert settings.paper_fill_poll_seconds >= settings.api_id_min_interval_seconds
+    assert settings.paper_fill_poll_seconds == 3
+    broker.poll_working(now, settings)
+    broker.poll_working(now, settings)
+    assert client.calls == ["kt00007", "kt00018"]
+    broker.poll_working(now + timedelta(seconds=3), settings)
+    assert client.calls == ["kt00007", "kt00018", "kt00007", "kt00018"]

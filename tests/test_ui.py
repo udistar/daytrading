@@ -96,6 +96,8 @@ ALTERNATES = {
     "partial_flat_ratio_pct": 40.0,
     "token_bucket_per_sec": 3.0,
     "paper_tr_per_sec": 0.5,
+    "api_id_min_interval_seconds": 2.0,
+    "api_rate_retry_count": 4,
     "live_order_per_sec": 4.0,
     "live_query_per_sec": 3.0,
     "ws_max_symbols": 40,

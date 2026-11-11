@@ -17,6 +17,7 @@ from daytrading.kiwoom import (
     LIVE_REST,
     KiwoomClient,
     KiwoomError,
+    call_limit_kwargs,
     condition_realtime_packet,
     extract_codes,
     order_fill_reg_packet,
@@ -140,6 +141,7 @@ class KiwoomBroker:
     def poll_working(self, now: datetime, settings: Settings) -> tuple[list[dict], list[str]]:
         if not self.working:
             return [], []
+        # 기본 3초. kt00007·kt00018은 서로 다른 API ID이고, 같은 ID는 클라이언트 간격 제한이 한 번 더 막는다.
         if self._last_poll is not None and (now - self._last_poll).total_seconds() < float(settings.paper_fill_poll_seconds):
             return [], []
         self._last_poll = now
@@ -210,7 +212,7 @@ def check_connection(
 ) -> CheckResult:
     """토큰 발급과 웹소켓 시세 등록만 확인한다. 주문 API는 호출하지 않는다."""
     try:
-        client = KiwoomClient(app_key, app_secret, mode="paper", opener=opener)
+        client = KiwoomClient(app_key, app_secret, mode="paper", opener=opener, **call_limit_kwargs(settings))
     except KiwoomError as exc:
         return CheckResult(False, str(exc))
     try:
@@ -413,7 +415,7 @@ def run_paper(
     sleeper: Callable[[float], None] | None = None,
 ) -> Engine:
     """모의투자 시세를 같은 엔진에 넣고, dry_run이 아니면 모의 주문만 전송한다."""
-    client = KiwoomClient(app_key, app_secret, mode="paper", opener=opener)
+    client = KiwoomClient(app_key, app_secret, mode="paper", opener=opener, **call_limit_kwargs(settings))
     client.issue_token()
     now_fn = clock or _now
     if meta_path is not None:

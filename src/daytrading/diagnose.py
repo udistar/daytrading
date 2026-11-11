@@ -107,7 +107,7 @@ def _read_one_trade(client, code: str, timeout: float = 20) -> dict:
 
 
 def run_diagnose(home: Path, settings: Settings) -> int:
-    from daytrading.kiwoom import KiwoomClient, KiwoomError, LiveTradingLocked
+    from daytrading.kiwoom import KiwoomClient, KiwoomError, LiveTradingLocked, call_limit_kwargs
     from daytrading.secrets import load_secrets, missing_secret_names
 
     secrets = load_secrets(home)
@@ -116,7 +116,12 @@ def run_diagnose(home: Path, settings: Settings) -> int:
         print("모의투자 키가 없습니다. " + ", ".join(missing), file=sys.stderr)
         return 1
     try:
-        client = KiwoomClient(secrets["KIWOOM_APP_KEY"], secrets["KIWOOM_APP_SECRET"], mode="paper")
+        client = KiwoomClient(
+            secrets["KIWOOM_APP_KEY"],
+            secrets["KIWOOM_APP_SECRET"],
+            mode="paper",
+            **call_limit_kwargs(settings),
+        )
         assert_paper_endpoint(client.base_url)
         assert_paper_endpoint(client.ws_url)
         client.issue_token()
