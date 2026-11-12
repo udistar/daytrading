@@ -71,6 +71,8 @@ def veto_buy(
         return "긴급 청산 중"
     if portfolio.paused:
         return "매매 중지"
+    if portfolio.quotes_down:
+        return "시세 끊김"
     if portfolio.loss_halted:
         return "하루 손실 한도"
     if portfolio.day_halted:

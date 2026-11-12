@@ -349,8 +349,12 @@ def parse_balance_map(payload: object) -> dict[str, dict[str, int]]:
         code = normalize_code(str(row.get("stk_cd") or ""))
         if not code:
             continue
-        slot = found.setdefault(code, {"qty": 0, "price": 0})
-        slot["qty"] += padded_int(row.get("rmnd_qty"))
+        slot = found.setdefault(code, {"qty": 0, "price": 0, "pur": 0, "cost": 0})
+        qty = padded_int(row.get("rmnd_qty"))
+        slot["qty"] += qty
+        slot["cost"] += padded_int(row.get("pur_pric")) * qty
+        if slot["qty"] > 0 and slot["cost"] > 0:
+            slot["pur"] = int(round(slot["cost"] / slot["qty"]))
         price = padded_int(row.get("cur_prc"))
         if price > 0:
             slot["price"] = price

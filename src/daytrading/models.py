@@ -19,6 +19,7 @@ EXIT_REASONS = frozenset(
         "hard_cutoff",
         "daily_loss",
         "emergency",
+        "carried",
     }
 )
 
@@ -242,6 +243,7 @@ class Portfolio:
     loss_halted: bool = False
     paused: bool = False
     emergency: bool = False
+    quotes_down: bool = False
     pending_buys: set[str] = field(default_factory=set)
     pending_buy_amount: dict[str, int] = field(default_factory=dict)
     pending_sells: set[str] = field(default_factory=set)

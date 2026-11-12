@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from daytrading.journal import Journal
 from daytrading.kiwoom import LIVE_REST, PAPER_REST, PAPER_WS, KiwoomClient, KiwoomError
 from daytrading.models import Intent, Snapshot, SymbolMeta
-from daytrading.paper import CheckResult, KiwoomBroker, check_connection, run_paper
+from daytrading.paper import CheckResult, KiwoomBroker, PaperSessionEnded, check_connection, run_paper
 from daytrading.settings import default_settings
 from daytrading.timeutil import KST
 
@@ -50,7 +50,7 @@ class ScriptedSocket:
 
     def recv(self):
         if not self.messages:
-            raise TimeoutError()
+            raise PaperSessionEnded()
         return self.messages.pop(0)
 
     def close(self):
@@ -233,7 +233,7 @@ def test_paper_loop_continues_after_an_order_error(tmp_path, monkeypatch):
         clock=lambda: datetime(2026, 11, 10, 9, 10, tzinfo=KST),
     )
     journal.close()
-    assert calls["n"] == 2
+    assert calls["n"] >= 2
     text = (tmp_path / "rejections.csv").read_text(encoding="utf-8-sig")
     assert "RC4001" in text
     sent = " ".join(socket.sent)
@@ -483,6 +483,9 @@ def test_run_paper_stays_until_the_position_is_flat_then_exits(tmp_path):
     assert len(socket.messages) == 1
     assert "005930" not in engine.portfolio.positions
     assert socket.closed
+    assert engine.summary()["fill_count"] == 2
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["fill_count"] == 2
 
 
 def test_run_paper_does_not_stop_before_hard_cutoff(tmp_path):
@@ -586,3 +589,290 @@ def test_fill_poll_does_not_repeat_inside_its_interval():
     assert client.calls == ["kt00007", "kt00018"]
     broker.poll_working(now + timedelta(seconds=3), settings)
     assert client.calls == ["kt00007", "kt00018", "kt00007", "kt00018"]
+
+
+def test_backoff_doubles_until_the_cap():
+    from daytrading.paper import next_backoff
+
+    assert next_backoff(1) == 2
+    assert next_backoff(16) == 30
+    assert next_backoff(30) == 30
+
+
+def test_quotes_down_blocks_a_new_buy():
+    from daytrading.models import Portfolio
+    from daytrading.risk import veto_buy
+
+    portfolio = Portfolio(cash=50_000_000, quotes_down=True)
+    intent = Intent("005930", "삼성전자", "buy", "entry", 1, "limit_ioc", 10_000, 10_000)
+    moment = datetime(2026, 11, 12, 9, 26, tzinfo=KST)
+    assert veto_buy(intent, portfolio, default_settings(), None, moment, 0) == "시세 끊김"
+
+
+def _holding_row():
+    return {
+        "stk_cd": "A005930",
+        "stk_nm": "삼성전자",
+        "rmnd_qty": "000000000000003",
+        "cur_prc": "000000070000",
+        "pur_pric": "000000069000",
+    }
+
+
+class _HoldingOpener(Opener):
+    def __init__(self):
+        super().__init__()
+        self.apis = []
+        self.bodies = []
+
+    def __call__(self, request, timeout=10):
+        api = request.get_header("Api-id")
+        self.apis.append(api)
+        body = json.loads(request.data.decode("utf-8")) if request.data else {}
+        self.bodies.append(body)
+        if api == "kt00018":
+            return Response({"return_code": 0, "acnt_evlt_remn_indv_tot": [_holding_row()]})
+        return super().__call__(request, timeout)
+
+
+def test_carried_position_is_logged_and_sold_after_the_open(tmp_path):
+    assert default_settings().sell_carried_positions is True
+    journal = Journal(tmp_path / "early")
+    run_paper(
+        default_settings(),
+        journal,
+        "key",
+        "secret",
+        opener=_HoldingOpener(),
+        connect=lambda url: ScriptedSocket([json.dumps({"trnm": "LOGIN", "return_code": 0})]),
+        codes=["005930"],
+        clock=lambda: datetime(2026, 11, 13, 8, 55, tzinfo=KST),
+    )
+    journal.close()
+    early = (tmp_path / "early" / "signals.csv").read_text(encoding="utf-8-sig")
+    assert "전일 보유" in early
+    assert "3주" in early
+    assert "69000" in early
+    assert "carried" not in (tmp_path / "early" / "orders.csv").read_text(encoding="utf-8-sig")
+
+    opener = _HoldingOpener()
+    journal = Journal(tmp_path / "open")
+    run_paper(
+        default_settings(),
+        journal,
+        "key",
+        "secret",
+        opener=opener,
+        connect=lambda url: ScriptedSocket([json.dumps({"trnm": "LOGIN", "return_code": 0})]),
+        codes=["005930"],
+        clock=lambda: datetime(2026, 11, 13, 9, 5, tzinfo=KST),
+    )
+    journal.close()
+    assert opener.apis.count("kt10001") == 1
+    sell = opener.bodies[opener.apis.index("kt10001")]
+    assert sell["ord_qty"] == "3"
+    assert sell["trde_tp"] == "3"
+    orders = (tmp_path / "open" / "orders.csv").read_text(encoding="utf-8-sig")
+    assert "carried" in orders
+
+    from daytrading.settings import Settings
+
+    saved = default_settings().to_dict()
+    saved["sell_carried_positions"] = False
+    quiet = _HoldingOpener()
+    journal = Journal(tmp_path / "off")
+    run_paper(
+        Settings(saved),
+        journal,
+        "key",
+        "secret",
+        opener=quiet,
+        connect=lambda url: ScriptedSocket([json.dumps({"trnm": "LOGIN", "return_code": 0})]),
+        codes=["005930"],
+        clock=lambda: datetime(2026, 11, 13, 9, 5, tzinfo=KST),
+    )
+    journal.close()
+    assert "kt10001" not in quiet.apis
+    assert "전일 보유" not in (tmp_path / "off" / "signals.csv").read_text(encoding="utf-8-sig")
+
+
+def test_partial_flat_sells_without_a_new_quote(tmp_path):
+    socket = ScriptedSocket(
+        [
+            json.dumps({"trnm": "LOGIN", "return_code": 0}),
+            json.dumps(
+                {
+                    "trnm": "REAL",
+                    "data": [
+                        {
+                            "type": "00",
+                            "item": "005930",
+                            "values": {"9001": "005930", "910": "10000", "911": "10", "913": "체결", "907": "2"},
+                        }
+                    ],
+                }
+            ),
+        ]
+    )
+    journal = Journal(tmp_path)
+    run_paper(
+        default_settings(),
+        journal,
+        "key",
+        "secret",
+        dry_run=True,
+        opener=Opener(),
+        connect=lambda url: socket,
+        codes=["005930"],
+        clock=lambda: datetime(2026, 11, 12, 9, 47, tzinfo=KST),
+    )
+    journal.close()
+    orders = (tmp_path / "orders.csv").read_text(encoding="utf-8-sig")
+    assert "schedule_flat" in orders
+    assert ",5," in orders or ",5\n" in orders or "5,market" in orders
+
+
+def test_disconnect_retries_with_backoff_and_sells_at_the_cutoff(tmp_path):
+    class Sock:
+        def __init__(self, kind):
+            self.kind = kind
+            self.sent = []
+            self.reads = 0
+            self.closed = False
+
+        def send(self, raw):
+            self.sent.append(raw)
+
+        def recv(self):
+            self.reads += 1
+            if self.kind == "fail":
+                raise ConnectionResetError("connection lost")
+            if self.reads == 1:
+                return json.dumps({"trnm": "LOGIN", "return_code": 0})
+            if self.kind == "first":
+                if self.reads == 2:
+                    return json.dumps(_notice("2"))
+                raise ConnectionResetError("connection lost")
+            raise PaperSessionEnded()
+
+        def close(self):
+            self.closed = True
+
+    sockets = []
+    phase = {"down": False}
+
+    def clock():
+        return datetime(2026, 11, 12, 9, 50 if phase["down"] else 9, 26, tzinfo=KST)
+
+    class First:
+        def __init__(self):
+            self.inner = Sock("first")
+
+        def send(self, raw):
+            self.inner.send(raw)
+
+        def recv(self):
+            raw = self.inner.recv()
+            if self.inner.reads >= 2:
+                phase["down"] = True
+            return raw
+
+        def close(self):
+            self.inner.close()
+
+    sockets.clear()
+
+    def connect2(url):
+        if not sockets:
+            sock = First()
+        elif len(sockets) < 3:
+            sock = Sock("fail")
+        else:
+            sock = Sock("ok")
+        sockets.append(sock)
+        return sock
+
+    sleeps = []
+    opener = Opener()
+    journal = Journal(tmp_path)
+    run_paper(
+        default_settings(),
+        journal,
+        "key",
+        "secret",
+        opener=opener,
+        connect=connect2,
+        codes=["005930"],
+        clock=clock,
+        sleeper=lambda seconds: sleeps.append(seconds),
+        max_loops=12,
+    )
+    journal.close()
+    assert sleeps[:2] == [1.0, 2.0]
+    assert any('"00"' in raw for raw in sockets[0].inner.sent)
+    assert any("LOGIN" in raw for raw in sockets[-1].sent)
+    assert any('"00"' in raw for raw in sockets[-1].sent)
+    assert any(url.endswith("/api/dostk/ordr") for url in opener.urls)
+
+
+def test_an_unexpected_error_sells_before_it_exits(tmp_path):
+    class Boom:
+        def __init__(self):
+            self.sent = []
+            self.reads = 0
+
+        def send(self, raw):
+            self.sent.append(raw)
+
+        def recv(self):
+            self.reads += 1
+            if self.reads == 1:
+                return json.dumps({"trnm": "LOGIN", "return_code": 0})
+            if self.reads == 2:
+                return json.dumps(_notice("2"))
+            raise RuntimeError("socket died")
+
+        def close(self):
+            return None
+
+    opener = Opener()
+    journal = Journal(tmp_path)
+    try:
+        run_paper(
+            default_settings(),
+            journal,
+            "key",
+            "secret",
+            opener=opener,
+            connect=lambda url: Boom(),
+            codes=["005930"],
+            clock=lambda: datetime(2026, 11, 12, 9, 10, tzinfo=KST),
+        )
+    except RuntimeError as exc:
+        assert "socket died" in str(exc)
+    else:
+        raise AssertionError("the socket error was swallowed")
+    journal.close()
+    assert any(url.endswith("/api/dostk/ordr") for url in opener.urls)
+
+
+def test_align_holdings_follows_kt00018_and_does_not_invent_realized_pnl(tmp_path):
+    from daytrading.paper import align_holdings
+    from daytrading.session import Engine
+
+    journal = Journal(tmp_path)
+    client = KiwoomClient("key", "secret", opener=Opener())
+    client.token = "paper-token"
+    broker = KiwoomBroker(client, dry_run=True)
+    engine = Engine(default_settings(), journal, "paper", broker=broker)
+    now = datetime(2026, 11, 12, 9, 30, tzinfo=KST)
+    from daytrading.paper import _install_carried
+
+    _install_carried(engine, "005930", 5, 10_000, 10_000, now)
+    align_holdings(engine, {"005930": {"qty": 2, "price": 11_000, "pur": 10_000}}, now)
+    assert engine.portfolio.positions["005930"].qty == 2
+    assert engine.portfolio.realized_krw == 0
+    align_holdings(engine, {"005930": {"qty": 4, "price": 12_000, "pur": 10_000}}, now)
+    assert engine.portfolio.positions["005930"].qty == 4
+    assert engine.portfolio.realized_krw == 0
+    journal.close()

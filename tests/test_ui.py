@@ -14,6 +14,7 @@ ALTERNATES = {
     "trading_mode": "paper",
     "live_trading_enabled": False,
     "allow_reentry_same_day": True,
+    "sell_carried_positions": False,
     "block_entry_when_meta_unknown": False,
     "watch_start": "08:50:00",
     "entry_start": "09:00:00",
