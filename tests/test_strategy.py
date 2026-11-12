@@ -86,6 +86,44 @@ def position(**kwargs):
     return Position(**base)
 
 
+def test_midday_clock_is_entry_closed_and_the_open_window_is_not():
+    """11:47은 기본 진입창(09:05~09:40) 밖이라 마감이다. 09:10은 시간 거절이 아니다."""
+    settings = default_settings()
+    book = portfolio()
+    midday = datetime(2026, 11, 10, 11, 47, tzinfo=KST)
+    assert entry_block_reason(good_snap(ts=midday), settings, book) == "신규 진입 마감"
+    _intents, rejected = evaluate(good_snap(ts=midday), book, settings)
+    assert rejected[0][1] == "신규 진입 마감"
+    assert "11:47:00" in rejected[0][2]
+    assert "09:05:00" in rejected[0][2]
+    assert "09:40:00" in rejected[0][2]
+    assert entry_block_reason(good_snap(ts=ts(9, 10)), settings, book) is None
+
+
+def test_minute_value_rejection_records_the_measured_won():
+    settings = validate_settings(
+        {
+            **default_settings().to_dict(),
+            "minute_value_min_krw": 5_000_000,
+            "minute_value_multiple": 1.0,
+            "minute_value_lookback_min": 3,
+            "cumulative_value_min_krw": 0,
+            "strength_min": 0.0,
+            "change_prev_min_pct": -10.0,
+            "change_prev_max_pct": 29.0,
+            "change_open_min_pct": -3.0,
+            "price_min_krw": 1_000,
+            "price_max_krw": 500_000,
+        }
+    )
+    snap = good_snap(minute_value=4_000_000, avg_minute_value=1_000_000, minute_samples=3)
+    intents, rejected = evaluate(snap, portfolio(), settings)
+    assert intents == []
+    assert rejected[0][1] == "1분 거래대금 부족"
+    assert "4000000" in rejected[0][2]
+    assert "5000000" in rejected[0][2]
+
+
 def test_good_snapshot_enters():
     settings = default_settings()
     snap = good_snap()
@@ -140,7 +178,9 @@ def test_breakout_rejection_is_recorded():
     snap = good_snap(bid_qty=6_000, ask_qty=1_000)
     intents, rejected = evaluate(snap, portfolio(), settings)
     assert intents == []
-    assert rejected == [("005930", "매수/매도 잔량비 초과")]
+    assert rejected[0][0] == "005930"
+    assert rejected[0][1] == "매수/매도 잔량비 초과"
+    assert "6000" in rejected[0][2]
 
 
 def test_entry_block_is_recorded_without_breakout_once_per_minute():
@@ -150,15 +190,17 @@ def test_entry_block_is_recorded_without_breakout_once_per_minute():
     blocked = good_snap(prev_price=10_600)
     intents, rejected = evaluate(blocked, book, settings, seen=seen)
     assert intents == []
-    assert rejected == [("005930", "직전 고가 돌파 아님")]
+    assert rejected[0][:2] == ("005930", "직전 고가 돌파 아님")
+    assert "10600" in rejected[0][2]
     _intents, again = evaluate(blocked, book, settings, seen=seen)
     assert again == []
     other = good_snap(code="000660", price=1_000)
     _intents, other_row = evaluate(other, book, settings, seen=seen)
-    assert other_row == [("000660", "주가 범위 밖")]
+    assert other_row[0][:2] == ("000660", "주가 범위 밖")
+    assert "1000" in other_row[0][2]
     later = good_snap(prev_price=10_600, ts=ts(9, 7))
     _intents, next_minute = evaluate(later, book, settings, seen=seen)
-    assert next_minute == [("005930", "직전 고가 돌파 아님")]
+    assert next_minute[0][:2] == ("005930", "직전 고가 돌파 아님")
 
 
 def test_add_blocks():

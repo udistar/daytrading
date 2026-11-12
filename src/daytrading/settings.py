@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from daytrading.timeutil import KST, parse_hms
@@ -49,6 +50,14 @@ SCHEMA: tuple[Field, ...] = (
     _f("trading_mode", "매매 모드", "계좌", "str", "paper", help="v0은 paper만 허용합니다. live는 저장할 수 없습니다."),
     _f("live_trading_enabled", "실전 매매 사용", "계좌", "bool", False, help="v0에서는 실전 주소가 잠겨 있어 켤 수 없습니다."),
     _f("allow_reentry_same_day", "당일 같은 종목 재진입", "계좌", "bool", False, help="한 번 청산한 종목을 같은 날 다시 살지. 기본은 끄기."),
+    _f(
+        "sell_carried_positions",
+        "전일 보유를 장 시작 후 매도",
+        "계좌",
+        "bool",
+        True,
+        help="모의 시작 때 kt00018에 잔고가 있으면 로그에 남기고, 장 시작 시각 이후 시장가로 팝니다.",
+    ),
     _f("block_entry_when_meta_unknown", "종목 정보 없으면 신규 매수 금지", "계좌", "bool", True, help="상장일·투자경고 여부를 모르면 사지 않습니다. 시뮬레이션은 정보를 채워서 보냅니다."),
     _f("watch_start", "관망 시작", "시간", "time", "09:00:00"),
     _f("entry_start", "신규 진입 시작", "시간", "time", "09:05:00"),
@@ -131,13 +140,56 @@ SCHEMA: tuple[Field, ...] = (
     _f("partial_flat_ratio_pct", "09:47 분할 청산 비율 (%)", "청산", "float", 50.0, 1.0, 100.0, "명세는 분할만 정하고 비율은 없어 절반을 기본값으로 둡니다. 나머지는 잔량 시장가 시각에 팝니다."),
     _f("token_bucket_per_sec", "자체 호출 상한 (초당)", "호출제한", "float", 4.0, 0.2, 4.0, decimals=1),
     _f("paper_tr_per_sec", "모의투자 TR당 초당 호출", "호출제한", "float", 1.0, 0.1, 1.0, decimals=1),
+    _f(
+        "api_id_min_interval_seconds",
+        "API ID 최소 간격 (초)",
+        "호출제한",
+        "float",
+        1.0,
+        1.0,
+        10.0,
+        "같은 API ID는 이 초 이상 간격을 둔다. 키움 공지(2026-11-09, i.kiwoom.com/restapi_notice_261109, 적용 2026-11-12 18시 이후)는 국내주식 계좌 TR 19개를 초당 5회에서 초당 1회로 바꾼다. 모의 서버는 그 19개 밖(주문, ka10077)도 API ID별 유량 1로 429를 내므로 모든 API ID에 적용한다. 주문 큐의 초당 상한과 TR 간격 중 더 긴 쪽을 함께 쓴다.",
+        1,
+    ),
+    _f(
+        "api_rate_retry_count",
+        "유량 초과 재시도 횟수",
+        "호출제한",
+        "int",
+        2,
+        0,
+        5,
+        "429(HTTP 429, return_code 5, 1700)이면 간격을 두고 다시 시도한다. 매수·매도는 다시 보내기 전에 kt00009로 접수 여부를 확인하고, 이미 있으면 다시 보내지 않는다.",
+    ),
     _f("live_order_per_sec", "실전 주문 초당 상한", "호출제한", "float", 5.0, 0.2, 5.0, "v0는 실전 주문을 보내지 않습니다. 상한만 저장합니다.", 1),
     _f("live_query_per_sec", "실전 조회 초당 상한", "호출제한", "float", 5.0, 0.2, 5.0, decimals=1),
     _f("ws_max_symbols", "실시간 등록 종목 수", "호출제한", "int", 80, 1, 80),
     _f("ranking_poll_seconds", "순위 조회 간격 (초)", "호출제한", "int", 8, 1, 120, "모의투자는 TR당 초당 1회라 기본을 8초로 둡니다."),
+    _f("paper_unfilled_cancel_seconds", "모의 미체결 취소 (초)", "호출제한", "int", 3, 1, 120, "모의 서버는 IOC를 받지 않아 보통 지정가를 내고, 이 초 안에 안 사지면 잔량을 취소합니다."),
+    _f(
+        "paper_fill_poll_seconds",
+        "모의 체결 조회 간격 (초)",
+        "호출제한",
+        "int",
+        3,
+        1,
+        120,
+        "kt00007과 kt00018은 이 간격마다 한 번씩만 조회한다. 기본 3초라 계좌 TR 초당 1회보다 느리다. 같은 API ID가 더 붙으면 API ID 최소 간격만큼 더 기다린다.",
+    ),
     _f("condition_max", "실시간 조건검색 최대 개수", "호출제한", "int", 10, 1, 10),
     _f("condition_seqs", "영웅문4 조건식 일련번호", "호출제한", "str", "", help="쉼표로 구분. 예: 0,1,2. 비우면 순위 조회만 사용합니다."),
-    _f("commission_rate_pct", "매매 수수료 (%, 편도)", "비용", "float", 0.015, 0.0, 1.0, "키움 FAQ 기준 0.015%. 계좌 요율에 맞게 바꾸세요.", 4),
+    _f("commission_rate_pct", "매매 수수료 (%, 편도)", "비용", "float", 0.015, 0.0, 1.0, "키움 FAQ 기준 0.015%. 시뮬레이션에 씁니다. 모의 호스트는 아래 모의 수수료를 씁니다.", 4),
+    _f(
+        "paper_commission_rate_pct",
+        "모의 매매 수수료 (%, 편도)",
+        "비용",
+        "float",
+        0.35,
+        0.0,
+        2.0,
+        "모의 호스트의 체결·실현손익에 씁니다. 키움 모의투자는 편도 0.35%입니다(2008-12-12부터, 무위험 호가차익 방지). REST 명세에는 요율이 없고, 2026-11-11 ka10074 조회(매수 14,742,380원+매도 15,120,880원, trde_cmsn 104,520원)가 편도 0.35%와 1원 차로 맞습니다. commission_rate_pct가 0.015여도 모의 호스트는 이 값을 씁니다.",
+        4,
+    ),
     _f("sell_tax_rate_pct", "매도세 (%, 거래세+농특세)", "비용", "float", 0.20, 0.0, 1.0, "비교 문서 기준 코스피·코스닥 매도세 0.20%.", 4),
     _f("sim_adverse_ticks", "시뮬레이션 불리 틱", "비용", "int", 1, 0, 10, "모의 체결을 이 틱만큼 불리하게 잡습니다."),
     _f(
@@ -213,6 +265,22 @@ class Settings:
 
 def default_settings() -> Settings:
     return Settings({field.key: field.default for field in SCHEMA})
+
+
+def on_paper_host(base_url: str | None) -> bool:
+    """주문 잠금과 같은 기준. 호스트 문자열이 mockapi.kiwoom.com 일 때만 모의다."""
+    return urlsplit(str(base_url or "")).netloc == "mockapi.kiwoom.com"
+
+
+def commission_pct(settings: Settings, *, paper_host: bool) -> float:
+    """모의 호스트는 paper_commission_rate_pct. 저장된 실전 요율은 바꾸지 않는다."""
+    if paper_host:
+        return float(settings.paper_commission_rate_pct)
+    return float(settings.commission_rate_pct)
+
+
+def trade_fee_krw(notional: int, settings: Settings, *, paper_host: bool) -> int:
+    return int(round(int(notional) * commission_pct(settings, paper_host=paper_host) / 100))
 
 
 def parse_tick_rules(text: str) -> list[tuple[int, int]]:

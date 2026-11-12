@@ -4,7 +4,7 @@ from daytrading.execution import OrderQueue, RateGate
 from daytrading.journal import Journal
 from daytrading.models import Intent
 from daytrading.session import Engine
-from daytrading.settings import default_settings
+from daytrading.settings import Settings, default_settings
 from daytrading.timeutil import KST
 
 
@@ -44,6 +44,24 @@ def test_token_bucket_and_paper_tr_spacing():
     assert other.ready("kt10001", moment) is False
     assert other.ready("kt10000", moment) is True
     assert other.ready("kt10001", moment + timedelta(seconds=1)) is True
+
+
+def test_queue_gap_follows_the_longer_api_id_interval_and_the_bucket_still_caps():
+    data = default_settings().to_dict()
+    data["api_id_min_interval_seconds"] = 2.0
+    data["paper_tr_per_sec"] = 1.0
+    data["token_bucket_per_sec"] = 4.0
+    gate = RateGate(Settings(data))
+    moment = datetime(2026, 9, 25, 9, 6, tzinfo=KST)
+    assert gate.take("kt10000", moment)
+    assert gate.ready("kt10000", moment + timedelta(seconds=1)) is False
+    assert gate.ready("kt10000", moment + timedelta(seconds=2)) is True
+    fresh = RateGate(Settings(data))
+    assert fresh.take("kt00007", moment)
+    assert fresh.ready("kt00018", moment) is True
+    for index in range(3):
+        assert fresh.take(f"other{index}", moment)
+    assert fresh.ready("last", moment) is False
 
 
 def test_blocked_head_does_not_let_lower_priority_through(tmp_path):

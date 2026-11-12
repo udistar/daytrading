@@ -12,7 +12,7 @@ from daytrading.ledger import apply_fill
 from daytrading.market import Market, quote_snapshot
 from daytrading.models import Intent, Portfolio, Snapshot
 from daytrading.risk import mark_to_market, protection_intents, veto_buy
-from daytrading.settings import Settings
+from daytrading.settings import Settings, commission_pct, on_paper_host
 from daytrading.strategy import evaluate, phase_name
 
 
@@ -93,7 +93,15 @@ class Engine:
                 continue
             snap = self._snap(intent.code, now)
             if intent.side == "buy":
-                veto = veto_buy(intent, self.portfolio, self.settings, snap, now, self._pnl())
+                veto = veto_buy(
+                    intent,
+                    self.portfolio,
+                    self.settings,
+                    snap,
+                    now,
+                    self._pnl(),
+                    commission_pct=self._commission_pct(),
+                )
                 if veto:
                     self.queue.pop()
                     self._release(intent)
@@ -115,6 +123,10 @@ class Engine:
             self._seq += 1
             record, fill = self.broker.submit(f"{self._seq:04d}", intent, snap, self.settings)
             self.journal.order(record)
+            if record.status == "rejected":
+                self._release(intent)
+                self.reject(now, intent.code, intent.side, "주문 거절", record.note)
+                continue
             if record.status in {"accepted", "dry_run"}:
                 if record.status == "dry_run":
                     self._release(intent)
@@ -136,8 +148,12 @@ class Engine:
         for intent in deferred:
             self.queue.push(intent)
 
+    def _commission_pct(self) -> float:
+        client = getattr(self.broker, "client", None)
+        return commission_pct(self.settings, paper_host=on_paper_host(getattr(client, "base_url", None)))
+
     def _pnl(self) -> int:
-        return mark_to_market(self.portfolio, self.prices, self.settings)
+        return mark_to_market(self.portfolio, self.prices, self.settings, commission_pct=self._commission_pct())
 
     def _snap(self, code: str, now: datetime) -> Snapshot | None:
         book = self.market.books.get(code)
@@ -219,9 +235,9 @@ def run_ticks(engine: Engine, ticks: list, controls: dict | None = None) -> dict
             intents, blocked = evaluate(snap, engine.portfolio, engine.settings, seen=seen)
             book.prev_price = book.last_price
             book.dirty = False
-            for blocked_code, reason in blocked:
+            for blocked_code, reason, detail in blocked:
                 side = "buy"
-                engine.reject(cursor, blocked_code, side, reason)
+                engine.reject(cursor, blocked_code, side, reason, detail)
             for intent in intents:
                 engine._clock = cursor
                 engine.enqueue(intent)

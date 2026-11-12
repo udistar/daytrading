@@ -73,8 +73,69 @@ def test_defaults_match_spec():
     assert settings.paper_tr_per_sec == 1.0
     assert settings.ws_max_symbols == 80
     assert settings.commission_rate_pct == 0.015
+    assert settings.paper_commission_rate_pct == 0.35
     assert settings.sell_tax_rate_pct == 0.20
     assert len({field.key for field in SCHEMA}) == len(SCHEMA)
+
+
+def test_saved_live_commission_does_not_replace_the_paper_host_rate(tmp_path):
+    from datetime import datetime
+
+    from daytrading.ledger import apply_fill
+    from daytrading.models import Fill, Portfolio
+    from daytrading.settings import commission_pct, trade_fee_krw
+    from daytrading.timeutil import KST
+
+    saved = validate_settings({**default_settings().to_dict(), "commission_rate_pct": 0.015, "paper_commission_rate_pct": 0.2})
+    assert commission_pct(saved, paper_host=False) == 0.015
+    assert commission_pct(default_settings(), paper_host=True) == 0.35
+    buy_notional = 14_742_380
+    sell_notional = 15_120_880
+    buy_fee = trade_fee_krw(buy_notional, default_settings(), paper_host=True)
+    sell_fee = trade_fee_krw(sell_notional, default_settings(), paper_host=True)
+    assert abs((buy_fee + sell_fee) - 104_520) <= 1
+    assert trade_fee_krw(buy_notional, saved, paper_host=False) == int(round(buy_notional * 0.015 / 100))
+    assert trade_fee_krw(buy_notional, saved, paper_host=True) == int(round(buy_notional * 0.2 / 100))
+    book = Portfolio(cash=50_000_000)
+    moment = datetime(2026, 11, 11, 10, 0, tzinfo=KST)
+    apply_fill(
+        book,
+        Fill("1", moment, "005930", "삼성전자", "buy", "entry", 1, buy_notional, buy_fee, 0, trigger_price=buy_notional),
+        default_settings(),
+    )
+    apply_fill(
+        book,
+        Fill("1", moment, "005930", "삼성전자", "sell", "stop", 1, sell_notional, sell_fee, 0, trigger_price=sell_notional),
+        default_settings(),
+    )
+    cheap_buy = int(round(buy_notional * 0.015 / 100))
+    cheap_sell = int(round(sell_notional * 0.015 / 100))
+    assert book.realized_krw == (sell_notional - sell_fee) - (buy_notional + buy_fee)
+    assert book.realized_krw != (sell_notional - cheap_sell) - (buy_notional + cheap_buy)
+    from daytrading.journal import Journal
+    from daytrading.kiwoom import KiwoomClient
+    from daytrading.models import Position
+    from daytrading.paper import KiwoomBroker
+    from daytrading.session import Engine
+
+    journal = Journal(tmp_path)
+    engine = Engine(saved, journal, "paper", broker=KiwoomBroker(KiwoomClient("k", "s"), dry_run=True))
+    engine.portfolio.positions["005930"] = Position(
+        "005930",
+        "삼성전자",
+        10,
+        100_000,
+        100_000,
+        10_000,
+        10_000,
+        1,
+        moment,
+        moment,
+        10_000,
+    )
+    engine.prices["005930"] = 10_000
+    assert engine._pnl() == 100_000 - int(round(100_000 * 0.2 / 100)) - int(round(100_000 * 0.20 / 100)) - 100_000
+    journal.close()
 
 
 def test_missing_keys_use_defaults():
