@@ -35,7 +35,12 @@ def parse_minute_rows(rows):
             continue
         bars.setdefault(dt.date(), {})[m] = {"m": m, "o": num(r.get("open_pric")) or c, "h": num(r.get("high_pric")) or c,
                                              "l": num(r.get("low_pric")) or c, "c": c, "v": num(r.get("trde_qty")) or 0}
-    return {d: [v[m] for m in sorted(v)] for d, v in bars.items()}
+    out = {d: [v[m] for m in sorted(v)] for d, v in bars.items()}
+    if len(out) > 1:
+        first = min(out)
+        if out[first][0]["m"] > 9 * 60:
+            del out[first]      # Kiwoom stops at a row limit: the oldest day starts mid-session, its range is wrong
+    return out
 
 
 class ReplayFeed:

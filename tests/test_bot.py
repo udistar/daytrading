@@ -281,6 +281,23 @@ class Backtest(unittest.TestCase):
                          [100, 90, 120, 110])
 
 
+class CutOffDay(unittest.TestCase):
+    def test_oldest_partial_day_dropped(self):
+        rows = synth_rows(days=3)
+        oldest = min(r["cntr_tm"][:8] for r in rows)
+        rows = [r for r in rows if not (r["cntr_tm"][:8] == oldest and r["cntr_tm"][8:12] < "1350")]
+        s = parse_minute_rows(rows)
+        self.assertEqual(len(s), 2)
+
+    def test_after_hours_bars_ignored(self):
+        rows = synth_rows(days=2)
+        day = max(r["cntr_tm"][:8] for r in rows)
+        rows.append({"cntr_tm": day + "160000", "cur_prc": "99999", "open_pric": "99999", "high_pric": "99999",
+                     "low_pric": "99999", "trde_qty": "5"})
+        s = parse_minute_rows(rows)
+        self.assertTrue(all(b["m"] <= 15 * 60 + 30 for bars in s.values() for b in bars))
+
+
 class RealMoneyLock(unittest.TestCase):
     def test_refuses_without_both_switches(self):
         self.assertEqual(main.main(["run", "--codes", "005930", "--mode", "real", "--config", "nope.json"]), 2)
