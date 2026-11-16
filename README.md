@@ -49,11 +49,32 @@ py -3 -m daytrading --check
 
 화면의 **모의투자 연결 확인** 버튼도 같습니다.
 
-같은 매매 규칙으로 모의투자 시세를 받아 주문까지 보내려면 아래를 실행합니다. 주문 주소는 `https://mockapi.kiwoom.com` 입니다. 실전 주소 `https://api.kiwoom.com` 은 코드에서 열리지 않습니다.
+같은 매매 규칙으로 모의투자 시세를 받아 주문까지 보내려면 아래를 실행합니다. 주문 주소는 `https://mockapi.kiwoom.com` 입니다. 실전 주소 `https://api.kiwoom.com` 은 코드에서 열리지 않습니다. 모의 서버는 IOC 주문을 거절하므로, 그 호스트의 지정가는 보통 주문으로 내고 설정한 초 안에 미체결이면 잔량을 취소합니다. 체결 통보가 없어도 kt00007·kt00018로 보유를 맞춥니다. 주문 오류는 기록하고 루프는 계속 돕니다.
 
 ```bat
 set PYTHONPATH=src
 py -3 -m daytrading --paper
+```
+
+거래대금이 왜 거절되는지, 지금 시각이 진입 창 안인지 보려면 아래를 실행합니다. 주문 API는 호출하지 않습니다. 주식체결 FID 14(누적거래대금)는 공식 명세가 백만원으로 적고, 이 프로그램은 그 값을 원으로 바꿔 필터와 비교합니다.
+
+```bat
+set PYTHONPATH=src
+py -3.14 -m daytrading --diagnose --home <폴더>
+```
+
+모의 계좌로 주문 경로만 확인하려면 아래를 실행합니다. `mockapi.kiwoom.com` 에만 붙고, 삼성전자 1주를 시장가로 산 뒤 체결·주문번호를 출력합니다. 평일 09:00~15:30이면 그 체결 수량만 바로 시장가로 팝니다. 실전 주소 `api.kiwoom.com` 이 접속 주소면 실행을 거부합니다.
+
+```bat
+set PYTHONPATH=src
+py -3.14 -m daytrading --smoke --home <폴더>
+```
+
+실전 주소로 주문을 내면 요청 전에 거절되는지만 보려면 아래를 실행합니다. 키를 읽지 않고, 네트워크 요청도 없습니다.
+
+```bat
+set PYTHONPATH=src
+py -3.14 -m daytrading --check-live-block
 ```
 
 주문 없이 시세만 엔진에 넣으려면 `--paper --dry-run` 을 씁니다. `--dry-run` 만 쓰면 `--check` 와 같이 접속만 확인합니다. 화면의 **모의투자 시작**은 확인을 받은 뒤 모의 서버로만 주문합니다. **매매 중지**는 새 매수를 멈추고 손절·청산은 계속합니다.

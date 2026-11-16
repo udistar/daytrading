@@ -111,6 +111,27 @@ def test_each_vi_release_records_its_own_time():
     assert book.vi_released_at == second_release
 
 
+def test_trailing_minute_keeps_won_after_fid14_is_scaled():
+    """14가 1000에서 1005로 오르면 5백만원이다. 원문 5와 비교하면 5,000,000원 하한에 항상 걸린다."""
+    from daytrading.kiwoom import parse_real_messages
+
+    def acc(raw: str) -> int:
+        event = parse_real_messages(
+            {"trnm": "REAL", "data": [{"type": "0B", "item": "005930", "values": {"10": "10000", "14": raw}}]}
+        )[0]
+        return int(event["acc_value"])
+
+    market = Market()
+    meta = _meta()
+    start = datetime(2026, 11, 10, 9, 10, tzinfo=KST)
+    _print(market, meta, start, 10_200, acc("1000"))
+    later = datetime(2026, 11, 10, 9, 11, 10, tzinfo=KST)
+    _print(market, meta, later, 10_250, acc("1005"))
+    snap = market.books["005930"].snapshot(later, default_settings())
+    assert snap.minute_value == 5_000_000
+    assert snap.acc_value == 1_005_000_000
+
+
 def test_minute_value_uses_the_trailing_minute_not_only_the_forming_bar():
     market = Market()
     meta = _meta()
