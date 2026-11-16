@@ -80,6 +80,8 @@ class Engine:
         pnl = self._pnl()
         if pnl <= -self.settings.daily_loss_limit_krw:
             self.portfolio.loss_halted = True
+        if now.time() >= self.settings.clock("market_flat_time"):
+            self._align_positions_to_balance()
         for intent in protection_intents(self.portfolio, self.prices, self.settings, now, pnl):
             self.enqueue(intent)
         deferred: list[Intent] = []
@@ -125,8 +127,12 @@ class Engine:
             self.journal.order(record)
             if record.status == "rejected":
                 self._release(intent)
+                if "매도가능수량 부족" in str(record.note or ""):
+                    self.portfolio.sell_blocked.add(intent.code)
+                self._apply_broker_sync()
                 self.reject(now, intent.code, intent.side, "주문 거절", record.note)
                 continue
+            self._apply_broker_sync()
             if record.status in {"accepted", "dry_run"}:
                 if record.status == "dry_run":
                     self._release(intent)
@@ -147,6 +153,44 @@ class Engine:
                 self.enqueue(extra)
         for intent in deferred:
             self.queue.push(intent)
+
+    def _align_positions_to_balance(self) -> None:
+        """강제 청산 전에 내부 수량을 kt00018 보유수량에 맞춘다."""
+        client = getattr(self.broker, "client", None)
+        if client is None or getattr(self.broker, "dry_run", False):
+            return
+        from daytrading.kiwoom import KiwoomError, parse_balance_map
+
+        try:
+            balances = parse_balance_map(client.balance())
+        except KiwoomError:
+            return
+        from daytrading.paper import align_holdings
+
+        align_holdings(self, balances, self._clock)
+        for code, position in list(self.portfolio.positions.items()):
+            extra = self.portfolio.pending_sell_qty.get(code, 0) - position.qty
+            if extra > 0:
+                self.portfolio.free_sell(code, extra)
+
+    def _apply_broker_sync(self) -> None:
+        broker = self.broker
+        sync = getattr(broker, "sync_qty", None)
+        if not sync:
+            return
+        for code, qty in list(sync.items()):
+            position = self.portfolio.positions.get(code)
+            if qty <= 0:
+                self.portfolio.positions.pop(code, None)
+                self.portfolio.free_sell(code, self.portfolio.pending_sell_qty.get(code, 0))
+            elif position is not None and qty < position.qty:
+                position.cost_krw = int(round(position.cost_krw * qty / position.qty))
+                position.fill_notional = int(round(position.fill_notional * qty / position.qty))
+                position.qty = qty
+                extra = self.portfolio.pending_sell_qty.get(code, 0) - position.qty
+                if extra > 0:
+                    self.portfolio.free_sell(code, extra)
+        sync.clear()
 
     def _commission_pct(self) -> float:
         client = getattr(self.broker, "client", None)

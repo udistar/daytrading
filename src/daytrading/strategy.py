@@ -31,6 +31,47 @@ def entry_time_block(moment: datetime, settings: Settings) -> str | None:
     return None
 
 
+FUND_NAME_PREFIXES = ("KODEX", "TIGER", "1Q", "ACE", "RISE", "SOL", "HANARO", "PLUS", "KIWOOM")
+
+
+def _product_code(code: str) -> str:
+    text = str(code or "").strip().upper()
+    if text.startswith("A") and len(text) == 7:
+        text = text[1:]
+    return text
+
+
+def _fund_name(name: str) -> bool:
+    text = str(name or "").strip().upper()
+    for prefix in FUND_NAME_PREFIXES:
+        if not text.startswith(prefix):
+            continue
+        rest = text[len(prefix) :]
+        if not rest or not rest[0].isalnum():
+            return True
+    return False
+
+
+def _lettered_product_code(code: str) -> bool:
+    """6자리 코드에 영문이 있으면 주식 단축코드가 아니다. 새 ETF·ETN 코드가 이 형식이다."""
+    text = _product_code(code)
+    return len(text) == 6 and any(ch.isalpha() for ch in text)
+
+
+def fund_exclusion(code: str, name: str, settings: Settings, market: str = "") -> str | None:
+    """ETF·ETN이면 제외 사유. 종목정보 플래그가 틀려도 코드·이름·시장 문구로 막는다."""
+    if not settings.exclude_etf and not settings.exclude_etn:
+        return None
+    market_text = str(market or "").upper()
+    if "ETN" in market_text and "ETF" not in market_text:
+        return "ETN 제외" if settings.exclude_etn else None
+    if "ETF" in market_text:
+        return "ETF 제외" if settings.exclude_etf else None
+    if _fund_name(name) or _lettered_product_code(code):
+        return "ETF 제외" if settings.exclude_etf else "ETN 제외"
+    return None
+
+
 def entry_block_reason(snap: Snapshot, settings: Settings, portfolio: Portfolio) -> str | None:
     blocked = entry_time_block(snap.ts, settings)
     if blocked:
@@ -39,6 +80,9 @@ def entry_block_reason(snap: Snapshot, settings: Settings, portfolio: Portfolio)
         return "당일 재진입 안 함"
     if snap.code in portfolio.positions and portfolio.positions[snap.code].qty > 0:
         return "이미 보유"
+    listed = fund_exclusion(snap.code, snap.name, settings)
+    if listed:
+        return listed
     meta = snap.meta
     if settings.block_entry_when_meta_unknown and not meta.flags_known:
         return "종목 정보 없음"

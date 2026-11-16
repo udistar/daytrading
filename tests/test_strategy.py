@@ -7,6 +7,7 @@ from daytrading.strategy import (
     add_block_reason,
     entry_block_reason,
     evaluate,
+    fund_exclusion,
     maybe_exit,
     phase_name,
 )
@@ -294,6 +295,23 @@ def test_vi_down_bar_and_schedule():
     rest = maybe_exit(good_snap(ts=ts(9, 49, 30), price=10_100), position(opened_at=ts(9, 46), schedule_partial_done=True), settings)
     assert rest.reason == "market_flat"
     assert rest.order_type == "market"
+
+
+def test_lettered_codes_and_fund_names_are_blocked_even_when_the_flag_is_off():
+    settings = default_settings()
+    assert settings.exclude_etf is True
+    assert fund_exclusion("0131V0", "1Q 미국우주항공테크", settings) == "ETF 제외"
+    assert fund_exclusion("A0131V0", "1Q 미국우주항공테크", settings) == "ETF 제외"
+    assert fund_exclusion("069500", "KODEX 200", settings) == "ETF 제외"
+    assert fund_exclusion("005930", "삼성전자", settings) is None
+    assert fund_exclusion("005930", "삼성전자", settings, market="ETF") == "ETF 제외"
+    snap = good_snap(code="0131V0", name="1Q 미국우주항공테크")
+    assert entry_block_reason(snap, settings, portfolio()) == "ETF 제외"
+    from daytrading.models import Intent
+    from daytrading.risk import veto_buy
+
+    intent = Intent("0131V0", "1Q 미국우주항공테크", "buy", "entry", 1, "limit_ioc", 10_000, 10_000)
+    assert veto_buy(intent, portfolio(), settings, None, ts(9, 6), 0) == "ETF 제외"
 
 
 def test_phase_names():

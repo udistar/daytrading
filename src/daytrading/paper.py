@@ -20,11 +20,16 @@ from daytrading.kiwoom import (
     KiwoomError,
     LiveTradingLocked,
     call_limit_kwargs,
+    cumulative_fill_delta,
+    liquidation_sell_qty,
+    parse_balance_map,
+    parse_day_realized,
+    parse_order_status_rows,
+    pending_sell_qty,
     condition_realtime_packet,
     extract_codes,
     order_fill_reg_packet,
     order_key,
-    parse_balance_map,
     parse_order_detail_rows,
     parse_real_messages,
     plan_order_sync,
@@ -66,6 +71,11 @@ class KiwoomBroker:
         self.carried: dict[str, int] = {}
         self.baseline_ready = False
         self._last_poll: datetime | None = None
+        self.filled_cum: dict[str, int] = {}
+        self.seen_fill_ids: set[str] = set()
+        self.sell_blocked: set[str] = set()
+        self.sell_attempts: dict[str, int] = {}
+        self.sync_qty: dict[str, int] = {}
         if LIVE_REST == client.base_url:
             raise KiwoomError("실전 주소로는 주문할 수 없습니다.")
 
@@ -87,6 +97,14 @@ class KiwoomBroker:
         self.triggers[(intent.code, intent.side)] = trigger
         if self.dry_run:
             return record, None
+        sized = self._liquidation_qty(intent, settings)
+        if sized is None:
+            record.status = "rejected"
+            record.note = "매도가능수량 부족" if intent.code in self.sell_blocked else "잔고 조회 실패"
+            return record, None
+        if sized != intent.qty:
+            intent.qty = sized
+            record.qty = sized
         self.place_calls += 1
         try:
             payload = self.client.place(
@@ -99,6 +117,10 @@ class KiwoomBroker:
         except KiwoomError as exc:
             record.status = "rejected"
             record.note = str(exc)
+            if "매도가능수량 부족" in str(exc):
+                self.sell_blocked.add(intent.code)
+                self.sell_attempts[intent.code] = CUTOFF_SELL_CAP
+                self._remember_balance_qty(intent.code)
             return record, None
         record.broker_order_no = str(payload.get("ord_no") or "")
         if intent.order_type != "market":
@@ -120,17 +142,27 @@ class KiwoomBroker:
             }
         return record, None
 
-    def take_fill_qty(self, order_no: str, qty: int) -> int:
-        """실시간 체결량. 이미 조회에 반영된 수량은 다시 넣지 않는다."""
+    def take_fill_qty(self, order_no: str, qty: int, fill_id: str = "") -> int:
+        """주문번호별 누적 체결수량. 이미 반영한 수량은 다시 넣지 않는다."""
+        if fill_id and fill_id in self.seen_fill_ids:
+            return 0
+        if fill_id:
+            self.seen_fill_ids.add(fill_id)
+        if not str(order_no).strip():
+            return int(qty)
         key = order_key(order_no)
         item = self.working.get(key)
-        if item is None:
-            return 0 if key in self.applied else qty
-        room = int(item["qty"]) - int(item["filled"])
-        delta = max(0, min(int(qty), room))
-        item["filled"] = int(item["filled"]) + delta
-        if item["filled"] >= item["qty"]:
-            item["done"] = True
+        booked = self.filled_cum.get(key, 0)
+        if item is not None:
+            booked = max(booked, int(item.get("filled") or 0))
+        delta = cumulative_fill_delta(booked, qty)
+        if item is not None:
+            room = int(item["qty"]) - int(item["filled"])
+            delta = min(delta, max(0, room))
+            item["filled"] = int(item["filled"]) + delta
+            if item["filled"] >= item["qty"]:
+                item["done"] = True
+        self.filled_cum[key] = booked + delta
         return delta
 
     def capture_baseline(self) -> None:
@@ -152,6 +184,9 @@ class KiwoomBroker:
         self._last_poll = now
         rows = parse_order_detail_rows(self.client.order_detail(""))
         balances = parse_balance_map(self.client.balance())
+        for item in self.working.values():
+            key = order_key(item.get("ord_no"))
+            self.filled_cum[key] = max(self.filled_cum.get(key, 0), int(item.get("filled") or 0))
         fills, cancels = plan_order_sync(
             self.working,
             rows,
@@ -161,12 +196,51 @@ class KiwoomBroker:
             float(settings.paper_unfilled_cancel_seconds),
             use_balance=self.baseline_ready,
         )
+        for item in self.working.values():
+            key = order_key(item.get("ord_no"))
+            self.filled_cum[key] = max(self.filled_cum.get(key, 0), int(item.get("filled") or 0))
         for key, item in list(self.working.items()):
             if item.get("done"):
                 if int(item["filled"]) < int(item["qty"]):
                     self.unfilled_done.append(item)
                 self.working.pop(key, None)
         return fills, cancels
+
+    def _liquidation_qty(self, intent: Intent, settings: Settings) -> int | None:
+        """청산 매도는 kt00018 매도가능수량에서 kt00009 미체결 매도를 뺀다."""
+        if intent.side != "sell" or intent.reason not in LIQUIDATION_REASONS:
+            return intent.qty
+        if intent.code in self.sell_blocked:
+            return None
+        if self.sell_attempts.get(intent.code, 0) >= CUTOFF_SELL_CAP:
+            self.sell_blocked.add(intent.code)
+            return None
+        try:
+            balances = parse_balance_map(self.client.balance())
+        except KiwoomError:
+            self.sell_attempts[intent.code] = self.sell_attempts.get(intent.code, 0) + 1
+            return None
+        slot = balances.get(intent.code, {})
+        held = int(slot.get("qty") or 0)
+        sellable = int(slot.get("sellable", held) or 0)
+        self.sync_qty[intent.code] = held
+        try:
+            rows = parse_order_status_rows(self.client.order_status(intent.code))
+        except KiwoomError:
+            rows = []
+        qty = liquidation_sell_qty(sellable, pending_sell_qty(rows, intent.code), intent.qty)
+        self.sell_attempts[intent.code] = self.sell_attempts.get(intent.code, 0) + 1
+        if qty <= 0:
+            self.sell_blocked.add(intent.code)
+            return None
+        return qty
+
+    def _remember_balance_qty(self, code: str) -> None:
+        try:
+            balances = parse_balance_map(self.client.balance())
+        except KiwoomError:
+            return
+        self.sync_qty[code] = int(balances.get(code, {}).get("qty") or 0)
 
     def forget_cancel(self, order_no: str) -> None:
         item = self.working.get(order_key(order_no))
@@ -363,7 +437,7 @@ def _apply_notice(engine: Engine, event: dict[str, Any], now: datetime) -> None:
     broker = engine.broker
     take = getattr(broker, "take_fill_qty", None)
     if take is not None:
-        qty = take(str(event.get("order_no") or ""), qty)
+        qty = take(str(event.get("order_no") or ""), qty, str(event.get("fill_id") or ""))
         if qty <= 0:
             return
     if code in engine.portfolio.pending_sells and code not in engine.portfolio.pending_buys:
@@ -402,6 +476,10 @@ def _apply_notice(engine: Engine, event: dict[str, Any], now: datetime) -> None:
 
 class PaperSessionEnded(Exception):
     """스크립트 소켓이 메시지를 다 보낸 뒤 루프를 끝낼 때 쓴다."""
+
+
+LIQUIDATION_REASONS = frozenset({"hard_cutoff", "market_flat", "schedule_flat", "emergency", "daily_loss", "carried"})
+CUTOFF_SELL_CAP = 3
 
 
 RECONNECT_BACKOFF_START = 1.0
@@ -528,7 +606,10 @@ def run_paper(
                 break
             except Exception as exc:
                 if _socket_timeout(exc):
-                    _clock_exits(engine, now_fn())
+                    now = now_fn()
+                    _clock_exits(engine, now)
+                    if now.time() >= settings.clock("hard_cutoff") and _cutoff_done(engine, dry_run):
+                        break
                     continue
                 if _socket_closed(exc):
                     engine.portfolio.quotes_down = True
@@ -562,11 +643,11 @@ def run_paper(
                 _clock_exits(engine, now)
             except KiwoomError as exc:
                 engine.reject(now, "", "buy", "주문 거절", str(exc))
-            if now.time() >= settings.clock("hard_cutoff") and not _open_positions(engine):
+            if now.time() >= settings.clock("hard_cutoff") and _cutoff_done(engine, dry_run):
                 break
     finally:
         _close_socket(sock)
-        journal.write_summary(engine.summary())
+        journal.write_summary(_summary_with_official(engine, client, now_fn(), dry_run))
     return engine
 
 
@@ -852,6 +933,44 @@ def _cancel_working(engine: Engine, order_no: str, now: datetime) -> None:
 
 def _open_positions(engine: Engine) -> bool:
     return any(position.qty > 0 for position in engine.portfolio.positions.values())
+
+
+def _cutoff_done(engine: Engine, dry_run: bool) -> bool:
+    """09:50 이후 kt00018 보유가 없으면 마감한다. 내부 수량만으로 끝내지 않는다."""
+    if dry_run:
+        return not _open_positions(engine)
+    broker = engine.broker
+    blocked = getattr(broker, "sell_blocked", set()) | engine.portfolio.sell_blocked
+    if _open_positions(engine):
+        open_codes = [code for code, position in engine.portfolio.positions.items() if position.qty > 0]
+        if any(code not in blocked for code in open_codes):
+            return False
+    try:
+        balances = parse_balance_map(broker.client.balance())
+    except KiwoomError:
+        return not _open_positions(engine)
+    if any(int(slot.get("qty") or 0) > 0 for slot in balances.values()):
+        return False
+    for code in list(engine.portfolio.positions):
+        engine.portfolio.positions.pop(code, None)
+    return True
+
+
+def _summary_with_official(engine: Engine, client: KiwoomClient, now: datetime, dry_run: bool) -> dict:
+    summary = engine.summary()
+    if dry_run:
+        return summary
+    try:
+        official = parse_day_realized(client.day_realized(now.date()))
+    except (KiwoomError, AttributeError):
+        return summary
+    if official is None:
+        return summary
+    summary["internal_realized_krw"] = summary["realized_krw"]
+    summary["realized_krw"] = official["realized_krw"]
+    summary["official_commission_krw"] = official["commission_krw"]
+    summary["official_tax_krw"] = official["tax_krw"]
+    return summary
 
 
 def _evaluate_dirty(engine: Engine, now: datetime, seen: dict) -> None:

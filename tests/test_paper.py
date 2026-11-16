@@ -835,11 +835,34 @@ def test_an_unexpected_error_sells_before_it_exits(tmp_path):
         def close(self):
             return None
 
-    opener = Opener()
+    class OneShare(Opener):
+        def __call__(self, request, timeout=10):
+            if request.get_header("Api-id") == "kt00018":
+                return Response(
+                    {
+                        "return_code": 0,
+                        "acnt_evlt_remn_indv_tot": [
+                            {
+                                "stk_cd": "A005930",
+                                "rmnd_qty": "000000000000001",
+                                "trde_able_qty": "000000000000001",
+                                "cur_prc": "000000010000",
+                                "pur_pric": "000000010000",
+                            }
+                        ],
+                    }
+                )
+            return super().__call__(request, timeout)
+
+    opener = OneShare()
+    saved = default_settings().to_dict()
+    saved["sell_carried_positions"] = False
+    from daytrading.settings import Settings
+
     journal = Journal(tmp_path)
     try:
         run_paper(
-            default_settings(),
+            Settings(saved),
             journal,
             "key",
             "secret",
@@ -876,3 +899,133 @@ def test_align_holdings_follows_kt00018_and_does_not_invent_realized_pnl(tmp_pat
     assert engine.portfolio.positions["005930"].qty == 4
     assert engine.portfolio.realized_krw == 0
     journal.close()
+
+
+def test_hard_cutoff_exits_when_the_broker_balance_is_flat(tmp_path):
+    class Idle:
+        def __init__(self):
+            self.reads = 0
+            self.sent = []
+
+        def send(self, raw):
+            self.sent.append(raw)
+
+        def recv(self):
+            self.reads += 1
+            if self.reads == 1:
+                return json.dumps({"trnm": "LOGIN", "return_code": 0})
+            raise TimeoutError()
+
+        def close(self):
+            return None
+
+    socket = Idle()
+    journal = Journal(tmp_path)
+    run_paper(
+        default_settings(),
+        journal,
+        "key",
+        "secret",
+        opener=Opener(),
+        connect=lambda url: socket,
+        codes=["005930"],
+        clock=lambda: datetime(2026, 11, 13, 9, 50, tzinfo=KST),
+        max_loops=6,
+    )
+    journal.close()
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["open_positions"] == []
+    assert socket.reads <= 3
+
+
+def test_cumulative_fill_qty_is_applied_once_per_order():
+    from daytrading.kiwoom import cumulative_fill_delta, liquidation_sell_qty, parse_day_realized
+
+    assert cumulative_fill_delta(0, 3) == 3
+    assert cumulative_fill_delta(3, 5) == 2
+    assert cumulative_fill_delta(5, 5) == 0
+    assert liquidation_sell_qty(1, 1, 100) == 0
+    assert liquidation_sell_qty(5, 2, 10) == 3
+    official = parse_day_realized({"rlzt_pl": "000000009862", "trde_cmsn": "104520", "trde_tax": "000000000200"})
+    assert official["realized_krw"] == 9862
+    assert parse_day_realized({"return_code": 0}) is None
+
+    client = KiwoomClient("key", "secret", opener=Opener())
+    client.token = "paper-token"
+    broker = KiwoomBroker(client, dry_run=False)
+    broker.working["1"] = {
+        "ord_no": "0000001",
+        "code": "005930",
+        "qty": 10,
+        "filled": 0,
+        "side": "buy",
+    }
+    assert broker.take_fill_qty("0000001", 3) == 3
+    assert broker.take_fill_qty("0000001", 5, "F2") == 2
+    assert broker.take_fill_qty("0000001", 5, "F2") == 0
+    assert broker.working["1"]["filled"] == 5
+
+
+def test_liquidation_sell_uses_sellable_qty_and_stops_after_a_shortage():
+    class Client:
+        def __init__(self, reject=False):
+            self.base_url = PAPER_REST
+            self.places = []
+            self.reject = reject
+
+        def balance(self):
+            return {
+                "acnt_evlt_remn_indv_tot": [
+                    {
+                        "stk_cd": "A005930",
+                        "rmnd_qty": "000000000000001",
+                        "trde_able_qty": "000000000000001",
+                        "cur_prc": "000000010000",
+                        "pur_pric": "000000010000",
+                    }
+                ]
+            }
+
+        def order_status(self, code=""):
+            if not self.places:
+                return {"acnt_ord_cntr_prst_array": []}
+            return {
+                "acnt_ord_cntr_prst_array": [
+                    {
+                        "ord_no": "0000001",
+                        "stk_cd": "A005930",
+                        "io_tp_nm": "현금매도",
+                        "ord_qty": "0000000001",
+                        "cntr_qty": "0000000000",
+                        "mdfy_cncl_tp": "",
+                    }
+                ]
+            }
+
+        def place(self, side, code, qty, price, market):
+            self.places.append(qty)
+            if self.reject:
+                raise KiwoomError("매도가능수량 부족")
+            return {"return_code": 0, "ord_no": "0000001"}
+
+    client = Client()
+    broker = KiwoomBroker(client, dry_run=False)
+    intent = Intent("005930", "삼성전자", "sell", "hard_cutoff", 100, "market", 0, 100)
+    record, _fill = broker.submit("1", intent, _snap(), default_settings())
+    assert record.status == "accepted"
+    assert client.places == [1]
+    again = Intent("005930", "삼성전자", "sell", "hard_cutoff", 100, "market", 0, 100)
+    refused, _fill = broker.submit("2", again, _snap(), default_settings())
+    assert refused.status == "rejected"
+    assert client.places == [1]
+    assert "005930" in broker.sell_blocked
+
+    rejecting = Client(reject=True)
+    broker = KiwoomBroker(rejecting, dry_run=False)
+    first = Intent("005930", "삼성전자", "sell", "hard_cutoff", 1, "market", 0, 1)
+    rejected, _fill = broker.submit("1", first, _snap(), default_settings())
+    assert rejected.status == "rejected"
+    assert "매도가능수량 부족" in rejected.note
+    second = Intent("005930", "삼성전자", "sell", "hard_cutoff", 1, "market", 0, 1)
+    broker.submit("2", second, _snap(), default_settings())
+    assert rejecting.places == [1]

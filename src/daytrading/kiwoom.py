@@ -272,10 +272,64 @@ def parse_order_status_rows(payload: object) -> list[dict[str, Any]]:
                 "code": normalize_code(str(row.get("stk_cd") or "")),
                 "side": _order_side(row.get("io_tp_nm")),
                 "ord_qty": padded_int(row.get("ord_qty")),
+                "cntr_qty": padded_int(row.get("cntr_qty")),
+                "cntr_known": "cntr_qty" in row,
+                "rem_qty": padded_int(row.get("ord_remnq")) if "ord_remnq" in row else None,
                 "mdfy_cncl": str(row.get("mdfy_cncl_tp") or ""),
             }
         )
     return parsed
+
+
+def cumulative_fill_delta(booked: int, reported: int) -> int:
+    """같은 주문번호의 누적 체결수량에서 아직 장부에 없는 수량만 돌려준다."""
+    return max(0, int(reported) - int(booked))
+
+
+def pending_sell_qty(rows: list[dict[str, Any]], code: str) -> int:
+    """kt00009에서 아직 체결되지 않은 매도 수량."""
+    target = normalize_code(code)
+    total = 0
+    for row in rows:
+        if row.get("code") != target or row.get("side") != "sell":
+            continue
+        if "취소" in str(row.get("mdfy_cncl") or ""):
+            continue
+        if row.get("cntr_known"):
+            unfilled = max(0, int(row.get("ord_qty") or 0) - int(row.get("cntr_qty") or 0))
+        elif row.get("rem_qty") is not None:
+            unfilled = int(row["rem_qty"])
+        else:
+            unfilled = 0
+        total += max(0, unfilled)
+    return total
+
+
+def liquidation_sell_qty(held_sellable: int, pending_sells: int, requested: int) -> int:
+    """매도가능수량에서 이미 접수된 매도를 뺀 뒤, 요청 수량을 넘지 않게 자른다."""
+    room = max(0, int(held_sellable) - int(pending_sells))
+    return max(0, min(int(requested), room))
+
+
+def parse_day_realized(payload: object) -> dict[str, int] | None:
+    """ka10074 실현손익. rlzt_pl 이 없으면 공식 숫자가 없는 것이다."""
+    if not isinstance(payload, dict) or "rlzt_pl" not in payload:
+        return None
+    return {
+        "realized_krw": _signed_int(payload.get("rlzt_pl")),
+        "commission_krw": _signed_int(payload.get("trde_cmsn")),
+        "tax_krw": _signed_int(payload.get("trde_tax")),
+    }
+
+
+def _signed_int(value: object) -> int:
+    text = str(value or "").strip().replace(",", "")
+    if not text or text in {"+", "-"}:
+        return 0
+    try:
+        return int(text)
+    except ValueError:
+        return 0
 
 
 def match_unseen_orders(rows: list[dict[str, Any]], *, code: str, qty: int, side: str, known: set[str]) -> list[str]:
@@ -349,7 +403,7 @@ def parse_balance_map(payload: object) -> dict[str, dict[str, int]]:
         code = normalize_code(str(row.get("stk_cd") or ""))
         if not code:
             continue
-        slot = found.setdefault(code, {"qty": 0, "price": 0, "pur": 0, "cost": 0})
+        slot = found.setdefault(code, {"qty": 0, "price": 0, "pur": 0, "cost": 0, "sellable": 0, "sellable_seen": 0})
         qty = padded_int(row.get("rmnd_qty"))
         slot["qty"] += qty
         slot["cost"] += padded_int(row.get("pur_pric")) * qty
@@ -358,6 +412,13 @@ def parse_balance_map(payload: object) -> dict[str, dict[str, int]]:
         price = padded_int(row.get("cur_prc"))
         if price > 0:
             slot["price"] = price
+        able = row.get("trde_able_qty")
+        if able not in (None, ""):
+            slot["sellable"] += padded_int(able)
+            slot["sellable_seen"] = 1
+    for slot in found.values():
+        if not slot.pop("sellable_seen"):
+            slot["sellable"] = slot["qty"]
     return found
 
 
@@ -572,12 +633,22 @@ def parse_real_messages(message: dict[str, Any]) -> list[dict[str, Any]]:
                 }
             )
         elif real_type == "00":
+            order_qty = signed_price(values.get("900"))
+            unfilled = signed_price(values.get("902"))
+            event_qty = signed_price(values.get("911")) or 0
+            # 900 주문수량과 902 미체결이 있으면 누적 체결은 그 차이다.
+            # 둘 다 없으면 911을 그 주문번호의 누적 체결수량으로 본다.
+            if order_qty is not None and unfilled is not None:
+                cumulative = max(0, order_qty - unfilled)
+            else:
+                cumulative = event_qty
             event.update(
                 {
                     "order_no": str(values.get("9203", "")),
+                    "fill_id": str(values.get("909", "") or ""),
                     "code": normalize_code(str(values.get("9001") or code)),
                     "fill_price": signed_price(values.get("910")),
-                    "fill_qty": signed_price(values.get("911")) or 0,
+                    "fill_qty": cumulative,
                     "side_flag": str(values.get("907", "")),
                     "status": str(values.get("913", "")),
                     "reject_reason": str(values.get("919", "")),
@@ -688,6 +759,11 @@ class KiwoomClient:
     def order_status(self, stk_cd: str = "") -> dict[str, Any]:
         """kt00009 계좌별주문체결현황. 주문 재시도 전에 접수 여부를 볼 때 쓴다."""
         return self._post(ACNT_PATH, order_status_body(stk_cd), api_id=TR_ORDER_STATUS, auth=True, retries=0)
+
+    def day_realized(self, day) -> dict[str, Any]:
+        """ka10074 일자별실현손익. 시작일과 종료일을 같은 날로 둔다."""
+        text = day.strftime("%Y%m%d")
+        return self._post(ACNT_PATH, {"strt_dt": text, "end_dt": text}, api_id="ka10074", auth=True)
 
     def modify(self, code: str, orig_ord_no: str, qty: int, limit_price: int, exchange: str = "KRX") -> dict[str, Any]:
         """kt10002 공식 예제와 같은 필드. 호스트 검사는 전송 직전에 한다."""

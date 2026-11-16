@@ -244,6 +244,7 @@ class Portfolio:
     paused: bool = False
     emergency: bool = False
     quotes_down: bool = False
+    sell_blocked: set[str] = field(default_factory=set)
     pending_buys: set[str] = field(default_factory=set)
     pending_buy_amount: dict[str, int] = field(default_factory=dict)
     pending_sells: set[str] = field(default_factory=set)

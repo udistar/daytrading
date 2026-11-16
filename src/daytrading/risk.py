@@ -67,6 +67,11 @@ def veto_buy(
 ) -> str | None:
     if intent.side != "buy":
         return None
+    from daytrading.strategy import fund_exclusion
+
+    listed = fund_exclusion(intent.code, intent.name, settings)
+    if listed:
+        return listed
     if portfolio.emergency:
         return "긴급 청산 중"
     if portfolio.paused:
@@ -137,6 +142,8 @@ def note_closed_trade(portfolio: Portfolio, pnl: int, now: datetime, settings: S
 def liquidate_intents(portfolio: Portfolio, prices: dict[str, int], reason: str) -> list[Intent]:
     intents = []
     for position in portfolio.positions.values():
+        if position.code in portfolio.sell_blocked:
+            continue
         room = portfolio.sell_room(position.code)
         if room <= 0:
             continue
